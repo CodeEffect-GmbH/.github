@@ -26,8 +26,12 @@ permissions:
   pull-requests: write
 
 concurrency:
+  # `cancel-in-progress` must only be true for pull request events. Every comment on the
+  # pull request starts an `issue_comment` run in this group (the ClickUp integration, for
+  # example, comments within seconds of a pull request being opened), and an unconditional
+  # cancel would kill the review that is still starting up and then skip itself.
   group: deepseek-cr-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 jobs:
   code-review:
@@ -63,6 +67,9 @@ the pull request:
   still skip drafts until they are marked ready for review.
 - The mention is configurable with the `mention` input of the reusable workflow, and the `issue_comment`
   trigger must be added by the calling repository.
+- Every comment on a pull request starts a workflow run, including comments that do not mention the bot
+  (an integration that links tasks, for example). Those runs are skipped in a few seconds and must not
+  interrupt a review - see the `cancel-in-progress` condition in the snippet above.
 
 ## What the reviewed repository owns
 
