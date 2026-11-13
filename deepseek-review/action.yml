@@ -59,6 +59,12 @@ inputs:
     description: Directory the policy file is resolved from.
     required: false
     default: .
+  pr-number:
+    description: >-
+      Pull request to review. Empty uses the pull request of the triggering event,
+      which also covers `issue_comment` triggers.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -80,7 +86,9 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       env:
         GITHUB_TOKEN: ${{ github.token }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
+        # Works for pull request events and for the `issue_comment` trigger that a
+        # re-review request uses.
+        PR_NUMBER: ${{ inputs.pr-number || github.event.pull_request.number || github.event.issue.number }}
         DEEPSEEK_API_KEY: ${{ inputs.deepseek-api-key }}
         DEEPSEEK_BASE_URL: ${{ inputs.base-url }}
         DEEPSEEK_MODEL: ${{ inputs.model }}
@@ -90,4 +98,9 @@ runs:
         REVIEW_EXCLUDE_PATTERNS: ${{ inputs.exclude-patterns }}
         REVIEW_POLICY_FILE: ${{ inputs.policy-file }}
         REVIEW_POLICY_FALLBACK_FILES: ${{ inputs.policy-fallback-files }}
+        # A comment that asks for a review also reviews a draft; a run triggered by
+        # a push waits until the draft is marked ready for review.
+        REVIEW_SKIP_DRAFT: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+        # Note added by the requester, only set for a comment triggered review.
+        REVIEW_COMMENT: ${{ github.event.comment.body }}
       run: node "$GITHUB_ACTION_PATH/deepseek-review.mjs"
