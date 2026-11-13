@@ -397,6 +397,7 @@ async function runReviewFlow(modelAnswer, options = {}) {
     REVIEW_EVENT: 'REQUEST_CHANGES',
     REVIEW_EXCLUDE_PATTERNS: 'package-lock.json,docsapp/RELEASENOTES.md',
     REVIEW_INCLUDE_PATTERNS: '',
+    REVIEW_BLOCK_SEVERITIES: options.blockSeverities ?? 'BUG,SECURITY,BREAKING',
     REVIEW_POLICY_FILE: options.policyFile ?? 'missing-policy.md',
     REVIEW_POLICY_FALLBACK_FILES: '',
     REVIEW_SKIP_DRAFT: String(options.skipDraft ?? true),
@@ -443,7 +444,7 @@ async function runReviewFlow(modelAnswer, options = {}) {
       request.method === 'GET' &&
       request.url.includes('/pulls/7/reviews')
     ) {
-      payload = [];
+      payload = options.reviews ?? [];
     } else if (
       request.method === 'GET' &&
       request.url.includes('/contents/')
@@ -470,6 +471,11 @@ async function runReviewFlow(modelAnswer, options = {}) {
       request.url.endsWith('/pulls/7/reviews')
     ) {
       payload = { id: 99 };
+    } else if (
+      request.method === 'PUT' &&
+      request.url.includes('/dismissals')
+    ) {
+      payload = { id: 98, state: 'DISMISSED' };
     } else {
       throw new Error(`unexpected request ${request.method} ${request.url}`);
     }
@@ -708,5 +714,89 @@ describe('review on request', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('blocking severities', () => {
+  const priorBlockingReview = {
+    id: 501,
+    state: 'CHANGES_REQUESTED',
+    commit_id: 'older-commit',
+    user: { login: 'github-actions[bot]', type: 'Bot' },
+  };
+
+  it('only comments on findings below the blocking severities', async () => {
+    const calls = await runReviewFlow(
+      JSON.stringify({
+        summary: 'Nits only.',
+        findings: [
+          { severity: 'MINOR', path: 'api/src/foo.ts', line: 11, title: 'Rename', body: 'b' },
+          { severity: 'PERFORMANCE', path: 'api/src/foo.ts', line: 12, title: 'Cache', body: 'b' },
+        ],
+      }),
+      { reviews: [priorBlockingReview] },
+    );
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.event, 'COMMENT');
+    assert.equal(posted.body.comments.length, 2);
+    assert.match(posted.body.body, /suggestions/);
+
+    // The earlier change request must be dismissed, otherwise the pull request stays
+    // blocked for a finding that no longer (or never) required a change.
+    const dismissal = calls.find((call) => call.method === 'PUT');
+    assert.equal(dismissal.url, 'https://api.github.com/repos/CodeEffect-GmbH/io.timeora.app/pulls/7/reviews/501/dismissals');
+  });
+
+  it('requests changes for a blocking severity', async () => {
+    const calls = await runReviewFlow(
+      JSON.stringify({
+        findings: [
+          { severity: 'MINOR', path: 'api/src/foo.ts', line: 11, title: 'Rename', body: 'b' },
+          { severity: 'SECURITY', path: 'api/src/foo.ts', line: 12, title: 'Leak', body: 'b' },
+        ],
+      }),
+      { reviews: [priorBlockingReview] },
+    );
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.event, 'REQUEST_CHANGES');
+    assert.doesNotMatch(posted.body.body, /suggestions/);
+  });
+
+  it('never requests changes when the blocking list is empty', async () => {
+    const calls = await runReviewFlow(
+      JSON.stringify({
+        findings: [
+          { severity: 'BUG', path: 'api/src/foo.ts', line: 11, title: 'Broken', body: 'b' },
+        ],
+      }),
+      { blockSeverities: '' },
+    );
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.event, 'COMMENT');
+  });
+
+  it('maps severity aliases onto the blocking list', async () => {
+    const calls = await runReviewFlow(
+      JSON.stringify({
+        findings: [
+          { severity: 'critical', path: 'api/src/foo.ts', line: 11, title: 'Broken', body: 'b' },
+        ],
+      }),
+      { blockSeverities: 'bug' },
+    );
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.event, 'REQUEST_CHANGES');
   });
 });

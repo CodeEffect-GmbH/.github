@@ -39,6 +39,13 @@ inputs:
     description: Comma separated globs that are never reviewed.
     required: false
     default: package-lock.json,**/package-lock.json,*.lock,**/*.lock
+  block-severities:
+    description: >-
+      Comma separated severities that make the review request changes. Findings of
+      every other severity are posted as plain comments. Set to an empty string to
+      never request changes.
+    required: false
+    default: BUG,SECURITY,BREAKING
   policy-file:
     description: >-
       Repository relative path of the markdown file holding the review policy of
@@ -96,6 +103,7 @@ runs:
         REVIEW_EVENT: ${{ inputs.event }}
         REVIEW_INCLUDE_PATTERNS: ${{ inputs.include-patterns }}
         REVIEW_EXCLUDE_PATTERNS: ${{ inputs.exclude-patterns }}
+        REVIEW_BLOCK_SEVERITIES: ${{ inputs.block-severities }}
         REVIEW_POLICY_FILE: ${{ inputs.policy-file }}
         REVIEW_POLICY_FALLBACK_FILES: ${{ inputs.policy-fallback-files }}
         # A comment that asks for a review also reviews a draft; a run triggered by

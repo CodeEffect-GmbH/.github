@@ -92,9 +92,10 @@ Only the review policy: a markdown file that is sent as the repository specific 
 | `model` | `deepseek-v4-flash` | DeepSeek model name. |
 | `base-url` | `https://api.deepseek.com` | DeepSeek API endpoint. |
 | `thinking` | `enabled` | Reasoning mode. `disabled` makes reviews much faster and shallower. |
-| `event` | `REQUEST_CHANGES` | Review event when the diff has findings. |
+| `event` | `REQUEST_CHANGES` | Review event when a finding of a blocking severity exists. |
 | `include-patterns` | _empty_ | Comma separated globs the review is restricted to. |
 | `exclude-patterns` | lockfiles | Comma separated globs that are never reviewed. |
+| `block-severities` | `BUG,SECURITY,BREAKING` | Severities that make the review request changes. Everything else is posted as a plain comment. |
 | `policy-file` | `.github/deepseek-review.md` | Review policy of the reviewed repository. |
 | `policy-fallback-files` | `AGENTS.md,.github/copilot-instructions.md` | Read when the policy file is missing. Set to an empty string to disable. |
 | `node-version` | `22` | Node.js version running the review. |
@@ -102,8 +103,32 @@ Only the review policy: a markdown file that is sent as the repository specific 
 | `mention` | `@deepseek-review` | Comment text that requests a new review. |
 | `pr-number` | _empty_ | Pull request to review; empty uses the triggering event (pull request or `issue_comment`). |
 
+## Blocking and clearing a change request
+
+A review requests changes only when at least one finding has a severity from `block-severities`
+(default `BUG,SECURITY,BREAKING`). Minor findings and suggestions are posted as ordinary comments and
+never block a merge, because a review state is not something a thread resolution can clear.
+
+GitHub keeps two independent gates, and they are easy to confuse:
+
+- **Unresolved conversations** - the review threads. Resolving them satisfies
+  "require conversation resolution".
+- **A change request** - the state of the review itself. Resolving every thread does **not** clear it; it
+  only ends when the same reviewer submits a new review that no longer requests changes, when it is
+  dismissed, or when the pull request is approved by that reviewer.
+
+That is why the review script dismisses its own earlier `CHANGES_REQUESTED` review on every run that does
+not request changes. The state therefore follows the latest review, and a pull request is never blocked by
+an outdated review. Two consequences:
+
+- After fixing, push. The new run re-reviews, dismisses the old change request and either requests changes
+  again or leaves a comment. No manual dismissal is needed.
+- Without a new commit, ask for a review with the mention (`@deepseek-review`) to get the same effect,
+  or use **Dismiss review** in the *Files changed* view of the pull request.
+
 ## Behaviour
 
+- Requests changes only for findings of a `block-severities` severity; every other finding is a comment.
 - Skips automatic runs on drafts (a requested review reviews them) and pull requests whose title or body
   contains `skip cr` or `skip review`.
 - Skips files without a text diff, removed files and everything matched by `exclude-patterns`.
