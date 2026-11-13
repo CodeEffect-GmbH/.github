@@ -399,6 +399,8 @@ async function runReviewFlow(modelAnswer, options = {}) {
     REVIEW_INCLUDE_PATTERNS: '',
     REVIEW_POLICY_FILE: options.policyFile ?? 'missing-policy.md',
     REVIEW_POLICY_FALLBACK_FILES: '',
+    REVIEW_SKIP_DRAFT: String(options.skipDraft ?? true),
+    REVIEW_COMMENT: options.comment ?? '',
     GITHUB_STEP_SUMMARY: '',
   };
   const previousEnv = {};
@@ -412,8 +414,9 @@ async function runReviewFlow(modelAnswer, options = {}) {
     number: 7,
     title,
     body: '',
-    draft: false,
+    draft: Boolean(options.draft),
     head: { sha: 'c0ffee1234567890' },
+    base: { sha: 'base-sha-1234' },
   };
 
   globalThis.fetch = async (url, init = {}) => {
@@ -441,6 +444,25 @@ async function runReviewFlow(modelAnswer, options = {}) {
       request.url.includes('/pulls/7/reviews')
     ) {
       payload = [];
+    } else if (
+      request.method === 'GET' &&
+      request.url.includes('/contents/')
+    ) {
+      const path = decodeURIComponent(
+        request.url.split('/contents/')[1].split('?')[0],
+      );
+      const content = options.repoFiles?.[path];
+      if (content === undefined) {
+        return new Response(JSON.stringify({ message: 'Not Found' }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      payload = {
+        path,
+        encoding: 'base64',
+        content: Buffer.from(content, 'utf8').toString('base64'),
+      };
     } else if (request.method === 'GET' && request.url.endsWith('/pulls/7')) {
       payload = pullRequest;
     } else if (
@@ -609,6 +631,80 @@ describe('review policy', () => {
       const completion = calls.find((call) => call.url.endsWith('/chat/completions'));
       assert.match(completion.body.messages[0].content, /POLICY-MARKER/);
       assert.match(completion.body.messages[0].content, /Output contract/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('review on request', () => {
+  it('adds the requester note to the user message', async () => {
+    const calls = await runReviewFlow(JSON.stringify({ findings: [] }), {
+      comment: '@deepseek-review please also check the migration order',
+    });
+    const completion = calls.find((call) => call.url.endsWith('/chat/completions'));
+    assert.match(
+      completion.body.messages[1].content,
+      /<comment>\n@deepseek-review please also check the migration order\n<\/comment>/,
+    );
+  });
+
+  it('omits the note for a run that was not requested in a comment', async () => {
+    const calls = await runReviewFlow(JSON.stringify({ findings: [] }));
+    const completion = calls.find((call) => call.url.endsWith('/chat/completions'));
+    assert.doesNotMatch(completion.body.messages[1].content, /<comment>/);
+  });
+
+  it('reviews a draft when the run was explicitly requested', async () => {
+    const skipped = await runReviewFlow(JSON.stringify({ findings: [] }), {
+      draft: true,
+    });
+    assert.equal(
+      skipped.find((call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews')),
+      undefined,
+    );
+
+    const reviewed = await runReviewFlow(JSON.stringify({ findings: [] }), {
+      draft: true,
+      skipDraft: false,
+      comment: '@deepseek-review',
+    });
+    assert.ok(
+      reviewed.find((call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews')),
+    );
+  });
+
+  it('loads the review policy from the base commit when there is no checkout', async () => {
+    const policyPath = 'nonexistent-dir/review-policy.md';
+    const calls = await runReviewFlow(JSON.stringify({ findings: [] }), {
+      policyFile: policyPath,
+      repoFiles: { [policyPath]: 'API-POLICY: scope every query by tenant.' },
+    });
+
+    const contents = calls.find((call) => call.url.includes('/contents/'));
+    assert.match(contents.url, /ref=base-sha-1234/);
+    assert.match(contents.url, /nonexistent-dir\/review-policy\.md/);
+
+    const completion = calls.find((call) => call.url.endsWith('/chat/completions'));
+    assert.match(completion.body.messages[0].content, /API-POLICY/);
+  });
+
+  it('prefers the working tree policy over the repository copy', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'deepseek-review-'));
+    try {
+      await writeFile(join(dir, 'policy.md'), 'local rules', 'utf8');
+      const local = await loadPolicy(
+        { policyFile: 'policy.md' },
+        { cwd: dir, readFromRepo: async () => 'remote rules' },
+      );
+      assert.equal(local.policy, 'local rules');
+
+      const remote = await loadPolicy(
+        { policyFile: 'absent.md' },
+        { cwd: dir, readFromRepo: async () => 'remote rules' },
+      );
+      assert.equal(remote.policy, 'remote rules');
+      assert.equal(remote.policySource, 'absent.md');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

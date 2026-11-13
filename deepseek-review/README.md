@@ -17,13 +17,16 @@ name: DeepSeek Code Review
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
+  # Optional: lets a member request a new review by commenting on the pull request.
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
   pull-requests: write
 
 concurrency:
-  group: deepseek-cr-${{ github.event.pull_request.number }}
+  group: deepseek-cr-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 jobs:
@@ -40,6 +43,26 @@ jobs:
 
 The workflow can also be used as a single step (`uses: CodeEffect-GmbH/.github/deepseek-review@main`)
 when a job needs its own steps around the review.
+
+## Reviewing again on request
+
+A review is triggered automatically by every push to the pull request. To review the same commit again -
+for example after dismissing the review, or to ask for a second look at something specific - comment on
+the pull request:
+
+```
+@deepseek-review please also check the migration order
+```
+
+- Only comments from `OWNER`, `MEMBER` and `COLLABORATOR` trigger a review (checked through
+  `author_association`); bot comments are ignored, so no loop is possible. The allowed associations are
+  fixed in the reusable workflow, not configurable per call.
+- The comment text is passed to the model as a request for extra attention. It cannot override the review
+  policy or the output contract.
+- A requested review also runs on a draft pull request, because it is an explicit request; automatic runs
+  still skip drafts until they are marked ready for review.
+- The mention is configurable with the `mention` input of the reusable workflow, and the `issue_comment`
+  trigger must be added by the calling repository.
 
 ## What the reviewed repository owns
 
@@ -69,18 +92,21 @@ Only the review policy: a markdown file that is sent as the repository specific 
 | `policy-fallback-files` | `AGENTS.md,.github/copilot-instructions.md` | Read when the policy file is missing. Set to an empty string to disable. |
 | `node-version` | `22` | Node.js version running the review. |
 | `working-directory` | `.` | Directory the policy file is resolved from. |
+| `mention` | `@deepseek-review` | Comment text that requests a new review. |
+| `pr-number` | _empty_ | Pull request to review; empty uses the triggering event (pull request or `issue_comment`). |
 
 ## Behaviour
 
-- Skips drafts (when called with `if: github.event.pull_request.draft == false`) and pull requests whose
-  title or body contains `skip cr` or `skip review`.
+- Skips automatic runs on drafts (a requested review reviews them) and pull requests whose title or body
+  contains `skip cr` or `skip review`.
 - Skips files without a text diff, removed files and everything matched by `exclude-patterns`.
 - Annotates every diff line with its new-file line number, so findings can reference a line GitHub
   actually accepts; a finding with an unusable line is moved into the review body instead of failing.
 - Dismisses the bot's own earlier `CHANGES_REQUESTED` reviews before submitting a new one, so an outdated
   review cannot keep blocking the pull request.
 - Re-checks the head commit before posting, so a run overtaken by a new push submits nothing.
-- Never checks out or executes pull request code: only the diff text is read.
+- Never checks out or executes pull request code: the diff is read as text from the API, and the review
+  policy is read through the API at the base commit of the pull request, so a run needs no checkout at all.
 
 ## Requirements in the reviewed repository
 
