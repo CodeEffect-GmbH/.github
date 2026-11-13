@@ -1,0 +1,93 @@
+name: DeepSeek pull request review
+description: >-
+  Reviews a pull request diff with DeepSeek and submits one pull request review
+  with `event: REQUEST_CHANGES` and one inline comment per finding.
+
+branding:
+  icon: message-square
+  color: purple
+
+inputs:
+  deepseek-api-key:
+    description: DeepSeek API token used for the review request.
+    required: true
+  model:
+    description: DeepSeek model name.
+    required: false
+    default: deepseek-v4-flash
+  base-url:
+    description: DeepSeek API base URL.
+    required: false
+    default: https://api.deepseek.com
+  thinking:
+    description: Reasoning mode, `enabled` or `disabled`.
+    required: false
+    default: enabled
+  event:
+    description: >-
+      Review event used when the diff has findings. A diff without findings is
+      always submitted as a neutral COMMENT review.
+    required: false
+    default: REQUEST_CHANGES
+  include-patterns:
+    description: >-
+      Comma separated globs the review is restricted to. Empty reviews every
+      changed file that is not excluded.
+    required: false
+    default: ''
+  exclude-patterns:
+    description: Comma separated globs that are never reviewed.
+    required: false
+    default: package-lock.json,**/package-lock.json,*.lock,**/*.lock
+  policy-file:
+    description: >-
+      Repository relative path of the markdown file holding the review policy of
+      the reviewed repository.
+    required: false
+    default: .github/deepseek-review.md
+  policy-fallback-files:
+    description: >-
+      Comma separated files that are read when the policy file does not exist.
+      Set to an empty string to review with the generic rules only.
+    required: false
+    default: AGENTS.md,.github/copilot-instructions.md
+  node-version:
+    description: Node.js version used to run the review.
+    required: false
+    default: '22'
+  working-directory:
+    description: Directory the policy file is resolved from.
+    required: false
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    # A broken script must fail the job instead of posting a wrong review.
+    - name: Check the review tooling
+      shell: bash
+      run: node --test "$GITHUB_ACTION_PATH/deepseek-review.test.mjs"
+
+    # The pull request head is deliberately NOT checked out: only the diff text
+    # fetched through the API is read, never pull request code.
+    - name: Review the pull request
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        DEEPSEEK_API_KEY: ${{ inputs.deepseek-api-key }}
+        DEEPSEEK_BASE_URL: ${{ inputs.base-url }}
+        DEEPSEEK_MODEL: ${{ inputs.model }}
+        DEEPSEEK_THINKING: ${{ inputs.thinking }}
+        REVIEW_EVENT: ${{ inputs.event }}
+        REVIEW_INCLUDE_PATTERNS: ${{ inputs.include-patterns }}
+        REVIEW_EXCLUDE_PATTERNS: ${{ inputs.exclude-patterns }}
+        REVIEW_POLICY_FILE: ${{ inputs.policy-file }}
+        REVIEW_POLICY_FALLBACK_FILES: ${{ inputs.policy-fallback-files }}
+      run: node "$GITHUB_ACTION_PATH/deepseek-review.mjs"
