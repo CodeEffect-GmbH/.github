@@ -1,0 +1,106 @@
+# Reusable DeepSeek code review for the repositories of this organization.
+#
+# Call it from a repository that should be reviewed:
+#
+#   jobs:
+#     code-review:
+#       uses: CodeEffect-GmbH/.github/.github/workflows/deepseek-review.yml@main
+#       permissions:
+#         contents: read
+#         pull-requests: write
+#       secrets:
+#         deepseek-api-key: ${{ secrets.<your DeepSeek token secret> }}
+#
+# The reviewed repository only has to provide its review policy, by default
+# `.github/deepseek-review.md` (see the `deepseek-review` action in this repository).
+# Everything else - diff handling, line validation, review submission - is generic.
+#
+# Call it from a `pull_request_target` trigger of the calling repository: the event
+# type is what makes the number available and what keeps pull request code from
+# running with a write token.
+
+name: DeepSeek Code Review
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: DeepSeek model name.
+        type: string
+        default: deepseek-v4-flash
+      base-url:
+        description: DeepSeek API base URL.
+        type: string
+        default: https://api.deepseek.com
+      thinking:
+        description: Reasoning mode, `enabled` or `disabled`.
+        type: string
+        default: enabled
+      event:
+        description: Review event when the diff has findings.
+        type: string
+        default: REQUEST_CHANGES
+      include-patterns:
+        description: Comma separated globs the review is restricted to.
+        type: string
+        default: ''
+      exclude-patterns:
+        description: Comma separated globs that are never reviewed.
+        type: string
+        default: package-lock.json,**/package-lock.json,*.lock,**/*.lock
+      policy-file:
+        description: Repository relative path of the review policy file.
+        type: string
+        default: .github/deepseek-review.md
+      policy-fallback-files:
+        description: Comma separated files read when the policy file is missing.
+        type: string
+        default: AGENTS.md,.github/copilot-instructions.md
+      node-version:
+        description: Node.js version used to run the review.
+        type: string
+        default: '22'
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        default: 30
+    secrets:
+      deepseek-api-key:
+        description: DeepSeek API token used for the review request.
+        required: true
+
+# A called workflow can only reduce the permissions of its caller.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: Code Review
+    # Drafts are reviewed when they are marked ready for review.
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      # The base branch is checked out for the review policy file only. Never point
+      # this at the pull request head: that would run pull request code with a write
+      # token. The review itself only reads the diff text from the API.
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: DeepSeek review
+        uses: CodeEffect-GmbH/.github/deepseek-review@main
+        with:
+          deepseek-api-key: ${{ secrets.deepseek-api-key }}
+          model: ${{ inputs.model }}
+          base-url: ${{ inputs.base-url }}
+          thinking: ${{ inputs.thinking }}
+          event: ${{ inputs.event }}
+          include-patterns: ${{ inputs.include-patterns }}
+          exclude-patterns: ${{ inputs.exclude-patterns }}
+          policy-file: ${{ inputs.policy-file }}
+          policy-fallback-files: ${{ inputs.policy-fallback-files }}
+          node-version: ${{ inputs.node-version }}
