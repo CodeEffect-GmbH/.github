@@ -105,6 +105,12 @@ export function readConfig() {
     maxDiffChars: toInt(process.env.REVIEW_MAX_DIFF_CHARS, 200_000),
     maxFileChars: toInt(process.env.REVIEW_MAX_FILE_CHARS, 40_000),
     maxFindings: toInt(process.env.REVIEW_MAX_FINDINGS, 25),
+    // Severities that make the review request changes. Every other finding is posted
+    // as a plain comment, so a suggestion can never leave a pull request blocked
+    // behind a review state that only a human can clear.
+    blockSeverities: splitPatterns(
+      process.env.REVIEW_BLOCK_SEVERITIES ?? 'BUG,SECURITY,BREAKING',
+    ).map((severity) => normalizeSeverity(severity)),
     // Explicit requests (a mention in a comment) review a draft too, an automatic
     // run triggered by a push does not.
     skipDraft:
@@ -939,6 +945,7 @@ export function buildReviewBody({
   payload,
   usage,
   model,
+  blocking = true,
 }) {
   const lines = [];
   const count = comments.length + demoted.length;
@@ -949,6 +956,13 @@ export function buildReviewBody({
   );
   if (summary) {
     lines.push('', summary);
+  }
+  if (!blocking && count > 0) {
+    lines.push(
+      '',
+      '> These findings are suggestions: none of them has a blocking severity, so',
+      '> this review does not request changes.',
+    );
   }
   if (demoted.length > 0) {
     lines.push('', '### Findings not attached to a line');
@@ -1016,6 +1030,9 @@ export async function main() {
   }
   if (selected.length === 0) {
     log('No reviewable file in this pull request, skipping the review.');
+    // A change request about files that are no longer part of the diff must not keep
+    // the pull request blocked.
+    await dismissOwnReviews(client, config, pullRequest.head.sha);
     return;
   }
 
@@ -1052,6 +1069,16 @@ export async function main() {
     return;
   }
 
+  const blockingFindings = [...comments, ...demoted].filter((finding) =>
+    config.blockSeverities.includes(finding.severity),
+  );
+  const mustRequestChanges = blockingFindings.length > 0;
+  log(
+    mustRequestChanges
+      ? `${comments.length} inline finding(s), ${blockingFindings.length} of a blocking severity, requesting changes.`
+      : `${comments.length} inline finding(s), none of a blocking severity.`,
+  );
+
   const body = buildReviewBody({
     pullRequest,
     summary: parsed.summary,
@@ -1060,11 +1087,10 @@ export async function main() {
     payload,
     usage: response.usage,
     model: response.model,
+    blocking: mustRequestChanges,
   });
   const event =
-    parsed.unparsed || (comments.length === 0 && demoted.length === 0)
-      ? 'COMMENT'
-      : config.event;
+    parsed.unparsed || !mustRequestChanges ? 'COMMENT' : config.event;
 
   await dismissOwnReviews(client, config, pullRequest.head.sha);
   await submitReview(client, config, {

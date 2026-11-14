@@ -48,6 +48,12 @@ on:
         description: Comma separated globs that are never reviewed.
         type: string
         default: package-lock.json,**/package-lock.json,*.lock,**/*.lock
+      block-severities:
+        description: >-
+          Comma separated severities that make the review request changes. Findings
+          of every other severity are posted as plain comments.
+        type: string
+        default: BUG,SECURITY,BREAKING
       policy-file:
         description: Repository relative path of the review policy file.
         type: string
@@ -117,6 +123,7 @@ jobs:
           event: ${{ inputs.event }}
           include-patterns: ${{ inputs.include-patterns }}
           exclude-patterns: ${{ inputs.exclude-patterns }}
+          block-severities: ${{ inputs.block-severities }}
           policy-file: ${{ inputs.policy-file }}
           policy-fallback-files: ${{ inputs.policy-fallback-files }}
           node-version: ${{ inputs.node-version }}
