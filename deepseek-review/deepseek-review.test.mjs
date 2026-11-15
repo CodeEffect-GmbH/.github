@@ -398,6 +398,8 @@ async function runReviewFlow(modelAnswer, options = {}) {
     REVIEW_EXCLUDE_PATTERNS: 'package-lock.json,docsapp/RELEASENOTES.md',
     REVIEW_INCLUDE_PATTERNS: '',
     REVIEW_BLOCK_SEVERITIES: options.blockSeverities ?? 'BUG,SECURITY,BREAKING',
+    REVIEW_THINKING_MAX_CHARS: String(options.thinkingMaxChars ?? 80000),
+    REVIEW_MAX_DIFF_CHARS: String(options.maxDiffChars ?? 200000),
     REVIEW_POLICY_FILE: options.policyFile ?? 'missing-policy.md',
     REVIEW_POLICY_FALLBACK_FILES: '',
     REVIEW_SKIP_DRAFT: String(options.skipDraft ?? true),
@@ -430,10 +432,13 @@ async function runReviewFlow(modelAnswer, options = {}) {
 
     let payload = null;
     if (request.url.endsWith('/chat/completions')) {
+      const answer = Array.isArray(modelAnswer)
+        ? (modelAnswer.shift() ?? '')
+        : modelAnswer;
       payload = {
         model: env.DEEPSEEK_MODEL,
-        choices: [{ message: { content: modelAnswer } }],
-        usage: { total_tokens: 42 },
+        choices: [{ message: { content: answer }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 42 },
       };
     } else if (
       request.method === 'GET' &&
@@ -798,5 +803,65 @@ describe('blocking severities', () => {
       (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
     );
     assert.equal(posted.body.event, 'REQUEST_CHANGES');
+  });
+});
+
+describe('empty model answers', () => {
+  it('retries without reasoning instead of failing the run', async () => {
+    const calls = await runReviewFlow([
+      '',
+      JSON.stringify({ summary: 'Fine.', findings: [] }),
+    ]);
+
+    const completions = calls.filter((call) => call.url.endsWith('/chat/completions'));
+    assert.equal(completions.length, 2);
+    assert.deepEqual(completions[0].body.thinking, { type: 'enabled' });
+    assert.deepEqual(completions[1].body.thinking, { type: 'disabled' });
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.event, 'COMMENT');
+  });
+
+  it('does not use reasoning for a large diff in the first place', async () => {
+    const calls = await runReviewFlow(JSON.stringify({ findings: [] }), {
+      thinkingMaxChars: 10,
+    });
+
+    const completions = calls.filter((call) => call.url.endsWith('/chat/completions'));
+    assert.equal(completions.length, 1);
+    assert.deepEqual(completions[0].body.thinking, { type: 'disabled' });
+  });
+
+  it('shrinks the diff on later attempts', async () => {
+    const bigPatch = ['@@ -1,0 +1,500 @@']
+      .concat(
+        Array.from(
+          { length: 500 },
+          (_, index) => `+const value${index} = ${index}; // padding for the diff budget`,
+        ),
+      )
+      .join('\n');
+
+    const calls = await runReviewFlow(['', '', JSON.stringify({ findings: [] })], {
+      files: [{ path: 'api/src/big.ts', filename: 'api/src/big.ts', patch: bigPatch }],
+      maxDiffChars: 8000,
+    });
+
+    const completions = calls.filter((call) => call.url.endsWith('/chat/completions'));
+    const firstPrompt = completions[0].body.messages[1].content;
+    const thirdPrompt = completions[2].body.messages[1].content;
+    assert.ok(
+      thirdPrompt.length < firstPrompt.length,
+      'the retry should carry a smaller diff',
+    );
+  });
+
+  it('fails with a diagnostic when every answer is empty', async () => {
+    await assert.rejects(
+      () => runReviewFlow(['', '', '', '']),
+      /returned no content \(finish_reason=/,
+    );
   });
 });

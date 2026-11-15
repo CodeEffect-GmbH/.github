@@ -36,6 +36,10 @@ on:
         description: Reasoning mode, `enabled` or `disabled`.
         type: string
         default: enabled
+      thinking-max-chars:
+        description: Diff size up to which reasoning is used.
+        type: string
+        default: '80000'
       event:
         description: Review event when the diff has findings.
         type: string
@@ -120,6 +124,7 @@ jobs:
           model: ${{ inputs.model }}
           base-url: ${{ inputs.base-url }}
           thinking: ${{ inputs.thinking }}
+          thinking-max-chars: ${{ inputs.thinking-max-chars }}
           event: ${{ inputs.event }}
           include-patterns: ${{ inputs.include-patterns }}
           exclude-patterns: ${{ inputs.exclude-patterns }}
