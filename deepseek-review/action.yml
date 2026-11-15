@@ -23,6 +23,13 @@ inputs:
     description: Reasoning mode, `enabled` or `disabled`.
     required: false
     default: enabled
+  thinking-max-chars:
+    description: >-
+      Diff size up to which reasoning is used. Above it the review runs without
+      reasoning, which is faster and returns an answer instead of an empty one when
+      the output budget would otherwise be spent on reasoning.
+    required: false
+    default: '80000'
   event:
     description: >-
       Review event used when the diff has findings. A diff without findings is
@@ -100,6 +107,7 @@ runs:
         DEEPSEEK_BASE_URL: ${{ inputs.base-url }}
         DEEPSEEK_MODEL: ${{ inputs.model }}
         DEEPSEEK_THINKING: ${{ inputs.thinking }}
+        REVIEW_THINKING_MAX_CHARS: ${{ inputs.thinking-max-chars }}
         REVIEW_EVENT: ${{ inputs.event }}
         REVIEW_INCLUDE_PATTERNS: ${{ inputs.include-patterns }}
         REVIEW_EXCLUDE_PATTERNS: ${{ inputs.exclude-patterns }}

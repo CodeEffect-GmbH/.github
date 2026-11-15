@@ -104,6 +104,10 @@ export function readConfig() {
     ),
     maxDiffChars: toInt(process.env.REVIEW_MAX_DIFF_CHARS, 200_000),
     maxFileChars: toInt(process.env.REVIEW_MAX_FILE_CHARS, 40_000),
+    // Reasoning above this diff size is what produced empty answers: the whole output
+    // budget went into reasoning and no review was left. Big diffs are reviewed
+    // without reasoning, which is also much faster.
+    thinkingMaxChars: toInt(process.env.REVIEW_THINKING_MAX_CHARS, 80_000),
     maxFindings: toInt(process.env.REVIEW_MAX_FINDINGS, 25),
     // Severities that make the review request changes. Every other finding is posted
     // as a plain comment, so a suggestion can never leave a pull request blocked
@@ -882,44 +886,79 @@ async function postCompletion(config, body) {
     );
   }
   const message = payload?.choices?.[0]?.message ?? {};
+  const choice = payload?.choices?.[0] ?? {};
+  const usage = payload?.usage ?? null;
   const content = String(message.content ?? '').trim();
   if (!content) {
-    throw new Error('DeepSeek returned an empty answer.');
+    // A reasoning model that hits its output budget returns no content at all: the
+    // whole budget went into reasoning. Report that, otherwise the only thing the log
+    // says is "empty answer" - which reads like a clean diff.
+    const reasoning = message.reasoning_content ?? message.reasoning ?? '';
+    const error = new Error(
+      'DeepSeek returned no content ' +
+        `(finish_reason=${choice.finish_reason ?? 'unknown'}, ` +
+        `completion_tokens=${usage?.completion_tokens ?? 'unknown'}, ` +
+        `prompt_tokens=${usage?.prompt_tokens ?? 'unknown'}, ` +
+        `reasoning=${reasoning ? 'yes' : 'no'})`,
+    );
+    error.finishReason = choice.finish_reason;
+    throw error;
+  }
+  if (usage) {
+    log(
+      `Tokens: prompt ${usage.prompt_tokens ?? '?'}, completion ${usage.completion_tokens ?? '?'}.`,
+    );
   }
   return {
     text: content,
-    usage: payload.usage ?? null,
+    usage,
     model: payload.model ?? config.model,
   };
 }
 
 /**
- * Sends the review request. `response_format` and `thinking` are both rejected by
- * some models, so the request degrades instead of failing the run.
+ * Sends the review request and degrades instead of failing the run: reasoning off,
+ * then a smaller diff, then plain JSON mode off. A large diff with reasoning enabled
+ * is what used to come back as an empty answer, so reasoning is skipped from the
+ * start when the diff is big (`thinkingMaxChars`).
+ *
+ * `buildUserPrompt` is called per attempt with a fraction of the diff to send.
  */
-async function requestReview(config, systemPrompt, userPrompt) {
-  const base = {
-    model: config.model,
-    stream: false,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ],
-    response_format: { type: 'json_object' },
-  };
-  if (config.thinking) {
-    base.thinking = { type: config.thinking };
+async function requestReview({
+  config,
+  systemPrompt,
+  allowThinking,
+  buildUserPrompt,
+}) {
+  const ladder = [
+    { thinking: allowThinking ? 'enabled' : 'disabled', fraction: 1, format: true },
+  ];
+  if (allowThinking) {
+    ladder.push({ thinking: 'disabled', fraction: 1, format: true });
   }
-  const withoutFormat = { ...base };
-  delete withoutFormat.response_format;
-  const plain = { ...withoutFormat };
-  delete plain.thinking;
+  ladder.push({ thinking: 'disabled', fraction: 0.5, format: true });
+  ladder.push({ thinking: 'disabled', fraction: 0.25, format: false });
 
   let lastError = null;
-  for (const [index, body] of [base, withoutFormat, plain].entries()) {
+  for (const [index, step] of ladder.entries()) {
+    const body = {
+      model: config.model,
+      stream: false,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: buildUserPrompt(step.fraction) },
+      ],
+      thinking: { type: step.thinking },
+    };
+    if (step.format) {
+      body.response_format = { type: 'json_object' };
+    }
     try {
       if (index > 0) {
-        log('Retrying the request with a reduced parameter set.');
+        log(
+          `Retry ${index}: reasoning ${step.thinking}, ${Math.round(step.fraction * 100)}% of the diff` +
+            `${step.format ? '' : ', no json mode'}.`,
+        );
       }
       return await postCompletion(config, body);
     } catch (error) {
@@ -1044,15 +1083,33 @@ export async function main() {
   const { policy, policySource } = await loadPolicy(config, {
     readFromRepo: (candidate) => readRepoFile(client, config, candidate, baseSha),
   });
-  const response = await requestReview(
-    config,
-    composeSystemPrompt({ policy, policySource }),
-    buildUserPrompt({
-      payload,
-      pullRequest,
-      extraContext: config.extraContext,
-    }),
+  const allowThinking =
+    Boolean(config.thinking) && payload.text.length <= config.thinkingMaxChars;
+  log(
+    allowThinking
+      ? `Reasoning enabled for ${payload.text.length} characters of diff.`
+      : `Reasoning disabled: ${payload.text.length} characters of diff, threshold ${config.thinkingMaxChars}.`,
   );
+  const response = await requestReview({
+    config,
+    systemPrompt: composeSystemPrompt({ policy, policySource }),
+    allowThinking,
+    buildUserPrompt: (fraction) =>
+      buildUserPrompt({
+        payload:
+          fraction >= 1
+            ? payload
+            : buildDiffPayload(selected, {
+                ...config,
+                maxDiffChars: Math.max(
+                  5_000,
+                  Math.round(payload.text.length * fraction),
+                ),
+              }),
+        pullRequest,
+        extraContext: config.extraContext,
+      }),
+  });
   const parsed = parseModelOutput(response.text);
   const { comments, demoted } = normalizeFindings(parsed.findings, selected, {
     maxFindings: config.maxFindings,

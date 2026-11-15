@@ -92,6 +92,7 @@ Only the review policy: a markdown file that is sent as the repository specific 
 | `model` | `deepseek-v4-flash` | DeepSeek model name. |
 | `base-url` | `https://api.deepseek.com` | DeepSeek API endpoint. |
 | `thinking` | `enabled` | Reasoning mode. `disabled` makes reviews much faster and shallower. |
+| `thinking-max-chars` | `80000` | Diff size up to which reasoning is used. Above it the review runs without reasoning. |
 | `event` | `REQUEST_CHANGES` | Review event when a finding of a blocking severity exists. |
 | `include-patterns` | _empty_ | Comma separated globs the review is restricted to. |
 | `exclude-patterns` | lockfiles | Comma separated globs that are never reviewed. |
@@ -129,6 +130,12 @@ an outdated review. Two consequences:
 ## Behaviour
 
 - Requests changes only for findings of a `block-severities` severity; every other finding is a comment.
+- Reviews a diff larger than `thinking-max-chars` without reasoning. A reasoning model that spends its
+  whole output budget on reasoning returns **no content at all**, which used to fail the job after three
+  retries on big pull requests (~140k characters of diff); the same diff reviews fine without reasoning and
+  in a fraction of the time.
+- Degrades instead of failing when the answer is empty or the parameters are rejected: reasoning off, then
+  half the diff, then a quarter without JSON mode. Every attempt is logged with the reason.
 - Skips automatic runs on drafts (a requested review reviews them) and pull requests whose title or body
   contains `skip cr` or `skip review`.
 - Skips files without a text diff, removed files and everything matched by `exclude-patterns`.
