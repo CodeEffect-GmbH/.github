@@ -58,6 +58,22 @@ on:
           of every other severity are posted as plain comments.
         type: string
         default: BUG,SECURITY,BREAKING
+      ledger:
+        description: Remember settled findings in a sticky comment so a re-review converges.
+        type: string
+        default: 'on'
+      ignore-directive:
+        description: Phrase that settles a finding when it appears in a reply.
+        type: string
+        default: /deepseek-ignore
+      breaker-label:
+        description: Label added when the review stops converging. Empty disables it.
+        type: string
+        default: ai-review:needs-decision
+      temperature:
+        description: Temperature of the first request, so repeated runs agree.
+        type: string
+        default: '0'
       policy-file:
         description: Repository relative path of the review policy file.
         type: string
@@ -95,6 +111,9 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  # The review state comment and the escalation label live on the issue side; a caller
+  # that does not grant it simply reviews without that memory.
+  issues: write
 
 jobs:
   review:
@@ -129,6 +148,10 @@ jobs:
           include-patterns: ${{ inputs.include-patterns }}
           exclude-patterns: ${{ inputs.exclude-patterns }}
           block-severities: ${{ inputs.block-severities }}
+          ledger: ${{ inputs.ledger }}
+          ignore-directive: ${{ inputs.ignore-directive }}
+          breaker-label: ${{ inputs.breaker-label }}
+          temperature: ${{ inputs.temperature }}
           policy-file: ${{ inputs.policy-file }}
           policy-fallback-files: ${{ inputs.policy-fallback-files }}
           node-version: ${{ inputs.node-version }}

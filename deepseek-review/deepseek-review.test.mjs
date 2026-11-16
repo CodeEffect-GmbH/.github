@@ -7,9 +7,11 @@ import { describe, it } from 'node:test';
 import {
   annotatePatch,
   buildDiffPayload,
+  buildLedgerBody,
   buildReviewBody,
   commentableLines,
   composeSystemPrompt,
+  fingerprintFinding,
   formatComment,
   loadPolicy,
   main,
@@ -404,6 +406,10 @@ async function runReviewFlow(modelAnswer, options = {}) {
     REVIEW_POLICY_FALLBACK_FILES: '',
     REVIEW_SKIP_DRAFT: String(options.skipDraft ?? true),
     REVIEW_COMMENT: options.comment ?? '',
+    REVIEW_LEDGER: options.ledger ?? 'on',
+    REVIEW_IGNORE_DIRECTIVE: '/deepseek-ignore',
+    REVIEW_BREAKER_LABEL: options.breakerLabel ?? 'ai-review:needs-decision',
+    REVIEW_TEMPERATURE: options.temperature ?? '0',
     GITHUB_STEP_SUMMARY: '',
   };
   const previousEnv = {};
@@ -481,6 +487,35 @@ async function runReviewFlow(modelAnswer, options = {}) {
       request.url.includes('/dismissals')
     ) {
       payload = { id: 98, state: 'DISMISSED' };
+    } else if (
+      request.method === 'GET' &&
+      request.url.endsWith('/pulls/7/comments')
+    ) {
+      payload = options.reviewComments ?? [];
+    } else if (
+      request.method === 'GET' &&
+      request.url.includes('/issues/7/comments')
+    ) {
+      payload = options.issueComments ?? [];
+    } else if (
+      request.method === 'POST' &&
+      request.url.includes('/issues/7/comments')
+    ) {
+      payload = { id: 900 };
+    } else if (
+      request.method === 'PATCH' &&
+      request.url.includes('/issues/comments/')
+    ) {
+      payload = { id: Number(request.url.split('/').pop()) };
+    } else if (
+      request.method === 'POST' &&
+      request.url.includes('/issues/7/labels')
+    ) {
+      payload = [{ name: 'ai-review:needs-decision' }];
+    } else if (request.url.endsWith('/graphql')) {
+      payload = options.graphql ?? {
+        data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } },
+      };
     } else {
       throw new Error(`unexpected request ${request.method} ${request.url}`);
     }
@@ -514,7 +549,7 @@ describe('review flow', () => {
           {
             severity: 'BUG',
             path: 'api/src/foo.ts',
-            line: 86,
+            line: 12,
             title: 'Missing tenant filter',
             body: 'Scope it.',
           },
@@ -552,7 +587,7 @@ describe('review flow', () => {
     assert.equal(posted.body.comments.length, 2);
     assert.deepEqual(posted.body.comments[0], {
       path: 'api/src/foo.ts',
-      line: 13,
+      line: 12,
       side: 'RIGHT',
       body: '**[BUG]** Missing tenant filter\n\nScope it.',
     });
@@ -863,5 +898,181 @@ describe('empty model answers', () => {
       () => runReviewFlow(['', '', '', '']),
       /returned no content \(finish_reason=/,
     );
+  });
+});
+
+describe('converging review', () => {
+  const path = 'api/src/foo.ts';
+  const bug = {
+    severity: 'BUG',
+    path,
+    line: 12,
+    title: 'Missing tenant filter',
+    body: 'Scope it.',
+  };
+  const ledgerComment = (entries) => [
+    { id: 900, body: buildLedgerBody({ entries }), user: { type: 'Bot' } },
+  ];
+  const entryFor = (overrides = {}) => ({
+    fingerprint: fingerprintFinding({ path, title: bug.title }),
+    path,
+    line: 12,
+    range: [10, 13],
+    severity: 'BUG',
+    title: bug.title,
+    state: 'open',
+    commentId: 555,
+    ...overrides,
+  });
+  const thread = (overrides = {}) => ({
+    data: {
+      repository: {
+        pullRequest: {
+          reviewThreads: {
+            nodes: [
+              {
+                isResolved: false,
+                comments: [
+                  {
+                    databaseId: 555,
+                    body: '**[BUG]** Missing tenant filter',
+                    author: { login: 'github-actions[bot]', __typename: 'Bot' },
+                  },
+                  {
+                    databaseId: 556,
+                    body: 'Fixed in abc1234.',
+                    author: { login: 'FejZa', __typename: 'User' },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    },
+    ...overrides,
+  });
+
+  it('does not repeat a finding that is already on record', async () => {
+    const calls = await runReviewFlow(JSON.stringify({ findings: [bug] }), {
+      issueComments: ledgerComment([entryFor({ state: 'answered' })]),
+      graphql: thread(),
+    });
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.comments.length, 0);
+    assert.equal(posted.body.event, 'COMMENT');
+    assert.match(posted.body.body, /left out/);
+  });
+
+  it('feeds the settled findings and their replies to the model', async () => {
+    const calls = await runReviewFlow(JSON.stringify({ findings: [] }), {
+      issueComments: ledgerComment([entryFor({ state: 'open' })]),
+      graphql: thread(),
+    });
+
+    const completion = calls.find((call) =>
+      call.url.endsWith('/chat/completions'),
+    );
+    const prompt = completion.body.messages[1].content;
+    assert.match(prompt, /Previous reviews of this pull request/);
+    assert.match(prompt, /Missing tenant filter/);
+    assert.match(prompt, /answered: Fixed in abc1234\./);
+    assert.match(prompt, /do not ask for the opposite/);
+  });
+
+  it('settles a finding whose thread was resolved', async () => {
+    const calls = await runReviewFlow(JSON.stringify({ findings: [] }), {
+      issueComments: ledgerComment([entryFor({ state: 'open' })]),
+      graphql: thread({ data: { repository: { pullRequest: { reviewThreads: { nodes: [
+        {
+          isResolved: true,
+          comments: [
+            {
+              databaseId: 555,
+              body: '**[BUG]** Missing tenant filter',
+              author: { login: 'github-actions[bot]', __typename: 'Bot' },
+            },
+          ],
+        },
+      ] } } } } }),
+    });
+
+    const patch = calls.find((call) => call.method === 'PATCH');
+    assert.match(patch.body.body, /resolved/);
+  });
+
+  it('records the ignore directive as a final decision', async () => {
+    const calls = await runReviewFlow(JSON.stringify({ findings: [] }), {
+      issueComments: ledgerComment([entryFor({ state: 'open' })]),
+      graphql: thread({ data: { repository: { pullRequest: { reviewThreads: { nodes: [
+        {
+          isResolved: false,
+          comments: [
+            {
+              databaseId: 555,
+              body: '**[BUG]** Missing tenant filter',
+              author: { login: 'github-actions[bot]', __typename: 'Bot' },
+            },
+            {
+              databaseId: 557,
+              body: '/deepseek-ignore by design, the seed is intentional',
+              author: { login: 'FejZa', __typename: 'User' },
+            },
+          ],
+        },
+      ] } } } } }),
+    });
+
+    const patch = calls.find((call) => call.method === 'PATCH');
+    assert.match(patch.body.body, /wontfix/);
+    assert.match(patch.body.body, /by design, the seed is intentional/);
+  });
+
+  it('does not block on a finding that sits on a context line', async () => {
+    const calls = await runReviewFlow(
+      JSON.stringify({ findings: [{ ...bug, line: 13, title: 'Context line' }] }),
+    );
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.comments.length, 1);
+    assert.equal(posted.body.event, 'COMMENT');
+  });
+
+  it('reports but does not block a new finding on settled code', async () => {
+    const calls = await runReviewFlow(
+      JSON.stringify({
+        findings: [{ ...bug, title: 'A different problem here' }],
+      }),
+      {
+        issueComments: ledgerComment([
+          entryFor({ state: 'answered', title: 'Something else entirely' }),
+        ]),
+        graphql: thread(),
+      },
+    );
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.comments.length, 1);
+    assert.equal(posted.body.event, 'COMMENT');
+    assert.match(posted.body.body, /does not converge/);
+    assert.ok(
+      calls.find((call) => call.url.includes('/issues/7/labels')),
+      'the escalation label should be added',
+    );
+  });
+
+  it('sends a deterministic temperature with the first request', async () => {
+    const calls = await runReviewFlow(JSON.stringify({ findings: [] }));
+    const completion = calls.find((call) =>
+      call.url.endsWith('/chat/completions'),
+    );
+    assert.equal(completion.body.temperature, 0);
   });
 });

@@ -24,6 +24,9 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  # The review state comment and the escalation label are issue side. Without it the
+  # review still runs, only without its memory.
+  issues: write
 
 concurrency:
   # `cancel-in-progress` must only be true for pull request events. Every comment on the
@@ -39,6 +42,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      issues: write
     secrets:
       deepseek-api-key: ${{ secrets.DEEPSEEK_CODEREVIEW_API_KEY }}
     with:
@@ -97,6 +101,10 @@ Only the review policy: a markdown file that is sent as the repository specific 
 | `include-patterns` | _empty_ | Comma separated globs the review is restricted to. |
 | `exclude-patterns` | lockfiles | Comma separated globs that are never reviewed. |
 | `block-severities` | `BUG,SECURITY,BREAKING` | Severities that make the review request changes. Everything else is posted as a plain comment. |
+| `ledger` | `on` | Remember settled findings in a sticky comment so a re-review converges. |
+| `ignore-directive` | `/deepseek-ignore` | Phrase that settles a finding when it appears in a reply. |
+| `breaker-label` | `ai-review:needs-decision` | Label added when the review stops converging. Empty disables it. |
+| `temperature` | `0` | Temperature of the first request, so repeated runs agree. |
 | `policy-file` | `.github/deepseek-review.md` | Review policy of the reviewed repository. |
 | `policy-fallback-files` | `AGENTS.md,.github/copilot-instructions.md` | Read when the policy file is missing. Set to an empty string to disable. |
 | `node-version` | `22` | Node.js version running the review. |
@@ -126,6 +134,35 @@ an outdated review. Two consequences:
   again or leaves a comment. No manual dismissal is needed.
 - Without a new commit, ask for a review with the mention (`@deepseek-review`) to get the same effect,
   or use **Dismiss review** in the *Files changed* view of the pull request.
+
+## Converging reviews
+
+A review is only useful if it converges. A one-shot model opinion per push does not: it forgets what it
+reported, it cannot see the replies, and it can end up asking for the opposite of what it asked for on the
+previous commit. Four rules keep it monotone:
+
+1. **The ledger.** One sticky comment per pull request records every finding with a fingerprint
+   (path + normalized title) and its state: `open`, `answered`, `resolved` or `wontfix`. Each run reads it,
+   reconciles it with the review threads (resolved threads and human replies are picked up automatically)
+   and only reports findings it has never reported. A repeat is dropped and mentioned in the summary.
+2. **Settled code does not block again.** A new finding whose hunk overlaps a settled finding is still
+   reported, but never as a change request. It is posted as a comment and the run adds the
+   `breaker-label`, because a review that keeps finding new problems on the same lines needs a human
+   decision, not another round.
+3. **Only added lines can block.** A finding on a context line - code this pull request did not write - is
+   a comment. Combined with `block-severities` this keeps the change request for defects in the change
+   itself.
+4. **A won't-fix decision is final.** Reply on a thread with the ignore directive and a reason
+   (`/deepseek-ignore by design, see ADR-7`) and the finding is recorded as `wontfix`: it is not raised
+   again and the reason travels with every later run.
+
+The previous findings and the replies are also sent to the model with an explicit contract - do not repeat
+a settled finding, never ask for the reverse of a change that was already requested, and say so explicitly
+if an earlier request turns out to be wrong. `temperature` is pinned on the first attempt so two runs on the
+same diff do not disagree on principle.
+
+The ledger needs `issues: write`. A caller that does not grant it still gets a review - it just has no
+memory, which is the old behaviour.
 
 ## Behaviour
 
