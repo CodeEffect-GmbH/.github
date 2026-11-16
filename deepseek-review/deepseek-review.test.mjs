@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
+  addedLines,
   annotatePatch,
+  asNodes,
   buildDiffPayload,
   buildLedgerBody,
   buildReviewBody,
@@ -21,6 +23,9 @@ import {
   normalizeSeverity,
   parseHunks,
   parseModelOutput,
+  planReviewBatches,
+  reconcileLedger,
+  remainingTimeoutMs,
   resolvePath,
   selectChangedFiles,
   shouldSkip,
@@ -402,6 +407,8 @@ async function runReviewFlow(modelAnswer, options = {}) {
     REVIEW_BLOCK_SEVERITIES: options.blockSeverities ?? 'BUG,SECURITY,BREAKING',
     REVIEW_THINKING_MAX_CHARS: String(options.thinkingMaxChars ?? 80000),
     REVIEW_MAX_DIFF_CHARS: String(options.maxDiffChars ?? 200000),
+    REVIEW_MAX_BATCHES: String(options.maxBatches ?? 6),
+    REVIEW_TIME_BUDGET_MINUTES: String(options.timeBudgetMinutes ?? 20),
     REVIEW_POLICY_FILE: options.policyFile ?? 'missing-policy.md',
     REVIEW_POLICY_FALLBACK_FILES: '',
     REVIEW_SKIP_DRAFT: String(options.skipDraft ?? true),
@@ -419,6 +426,13 @@ async function runReviewFlow(modelAnswer, options = {}) {
   }
 
   const calls = [];
+  // A part of a large diff takes minutes; the budget test moves the clock instead of
+  // waiting for one.
+  const originalNow = Date.now;
+  let clockOffset = 0;
+  if (options.advanceClockMs) {
+    Date.now = () => originalNow() + clockOffset;
+  }
   const pullRequest = {
     number: 7,
     title,
@@ -441,11 +455,22 @@ async function runReviewFlow(modelAnswer, options = {}) {
       const answer = Array.isArray(modelAnswer)
         ? (modelAnswer.shift() ?? '')
         : modelAnswer;
+      // An entry carrying a status models a rejected request, so a test can let one
+      // part of a diff fail and still expect a review.
+      if (answer && typeof answer === 'object' && answer.status) {
+        return new Response(
+          JSON.stringify({ error: { message: answer.message ?? 'rejected' } }),
+          { status: answer.status, headers: { 'content-type': 'application/json' } },
+        );
+      }
       payload = {
         model: env.DEEPSEEK_MODEL,
         choices: [{ message: { content: answer }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 42 },
       };
+      if (options.advanceClockMs && clockOffset === 0) {
+        clockOffset = options.advanceClockMs;
+      }
     } else if (
       request.method === 'GET' &&
       request.url.includes('/pulls/7/files')
@@ -489,7 +514,7 @@ async function runReviewFlow(modelAnswer, options = {}) {
       payload = { id: 98, state: 'DISMISSED' };
     } else if (
       request.method === 'GET' &&
-      request.url.endsWith('/pulls/7/comments')
+      request.url.includes('/pulls/7/comments')
     ) {
       payload = options.reviewComments ?? [];
     } else if (
@@ -513,6 +538,12 @@ async function runReviewFlow(modelAnswer, options = {}) {
     ) {
       payload = [{ name: 'ai-review:needs-decision' }];
     } else if (request.url.endsWith('/graphql')) {
+      if (options.graphql && typeof options.graphql === 'object' && options.graphql.status) {
+        return new Response(
+          JSON.stringify({ message: options.graphql.message ?? 'boom' }),
+          { status: options.graphql.status, headers: { 'content-type': 'application/json' } },
+        );
+      }
       payload = options.graphql ?? {
         data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } },
       };
@@ -529,6 +560,7 @@ async function runReviewFlow(modelAnswer, options = {}) {
     await main();
   } finally {
     globalThis.fetch = originalFetch;
+    Date.now = originalNow;
     for (const [key, value] of Object.entries(previousEnv)) {
       if (value === undefined) {
         delete process.env[key];
@@ -924,29 +956,30 @@ describe('converging review', () => {
     commentId: 555,
     ...overrides,
   });
+  // The real payload: reviewThreads and the comments of a thread are connections, so
+  // they arrive as `{ nodes: [...] }` and not as arrays.
+  const connection = (nodes) => ({ nodes });
   const thread = (overrides = {}) => ({
     data: {
       repository: {
         pullRequest: {
-          reviewThreads: {
-            nodes: [
-              {
-                isResolved: false,
-                comments: [
-                  {
-                    databaseId: 555,
-                    body: '**[BUG]** Missing tenant filter',
-                    author: { login: 'github-actions[bot]', __typename: 'Bot' },
-                  },
-                  {
-                    databaseId: 556,
-                    body: 'Fixed in abc1234.',
-                    author: { login: 'FejZa', __typename: 'User' },
-                  },
-                ],
-              },
-            ],
-          },
+          reviewThreads: connection([
+            {
+              isResolved: false,
+              comments: connection([
+                {
+                  databaseId: 555,
+                  body: '**[BUG]** Missing tenant filter',
+                  author: { login: 'github-actions[bot]', __typename: 'Bot' },
+                },
+                {
+                  databaseId: 556,
+                  body: 'Fixed in abc1234.',
+                  author: { login: 'FejZa', __typename: 'User' },
+                },
+              ]),
+            },
+          ]),
         },
       },
     },
@@ -986,18 +1019,18 @@ describe('converging review', () => {
   it('settles a finding whose thread was resolved', async () => {
     const calls = await runReviewFlow(JSON.stringify({ findings: [] }), {
       issueComments: ledgerComment([entryFor({ state: 'open' })]),
-      graphql: thread({ data: { repository: { pullRequest: { reviewThreads: { nodes: [
+      graphql: thread({ data: { repository: { pullRequest: { reviewThreads: connection([
         {
           isResolved: true,
-          comments: [
+          comments: connection([
             {
               databaseId: 555,
               body: '**[BUG]** Missing tenant filter',
               author: { login: 'github-actions[bot]', __typename: 'Bot' },
             },
-          ],
+          ]),
         },
-      ] } } } } }),
+      ]) } } } }),
     });
 
     const patch = calls.find((call) => call.method === 'PATCH');
@@ -1007,10 +1040,10 @@ describe('converging review', () => {
   it('records the ignore directive as a final decision', async () => {
     const calls = await runReviewFlow(JSON.stringify({ findings: [] }), {
       issueComments: ledgerComment([entryFor({ state: 'open' })]),
-      graphql: thread({ data: { repository: { pullRequest: { reviewThreads: { nodes: [
+      graphql: thread({ data: { repository: { pullRequest: { reviewThreads: connection([
         {
           isResolved: false,
-          comments: [
+          comments: connection([
             {
               databaseId: 555,
               body: '**[BUG]** Missing tenant filter',
@@ -1021,9 +1054,9 @@ describe('converging review', () => {
               body: '/deepseek-ignore by design, the seed is intentional',
               author: { login: 'FejZa', __typename: 'User' },
             },
-          ],
+          ]),
         },
-      ] } } } } }),
+      ]) } } } }),
     });
 
     const patch = calls.find((call) => call.method === 'PATCH');
@@ -1074,5 +1107,285 @@ describe('converging review', () => {
       call.url.endsWith('/chat/completions'),
     );
     assert.equal(completion.body.temperature, 0);
+  });
+});
+
+describe('graphql connection shapes', () => {
+  const connection = (nodes) => ({ nodes });
+
+  it('reads threads and their comments whether they are connected or plain', () => {
+    const entries = [
+      { fingerprint: 'a', path: 'a.ts', title: 'One', state: 'open', commentId: 1 },
+      { fingerprint: 'b', path: 'b.ts', title: 'Two', state: 'open', commentId: 2 },
+    ];
+    const comment = (databaseId, body, bot = false) => ({
+      databaseId,
+      body,
+      author: bot
+        ? { login: 'github-actions[bot]', __typename: 'Bot' }
+        : { login: 'FejZa', __typename: 'User' },
+    });
+
+    const connected = reconcileLedger(
+      entries,
+      connection([
+        {
+          isResolved: true,
+          comments: connection([
+            comment(1, '**[BUG]** One', true),
+            comment(11, 'Fixed.'),
+          ]),
+        },
+        { isResolved: false, comments: connection([comment(2, '**[BUG]** Two', true)]) },
+      ]),
+      '/deepseek-ignore',
+    );
+    const plain = reconcileLedger(
+      entries,
+      [
+        { isResolved: true, comments: [comment(1, '**[BUG]** One', true), comment(11, 'Fixed.')] },
+        { isResolved: false, comments: [comment(2, '**[BUG]** Two', true)] },
+      ],
+      '/deepseek-ignore',
+    );
+
+    assert.deepEqual(
+      connected.map((entry) => entry.state),
+      plain.map((entry) => entry.state),
+    );
+    assert.deepEqual(
+      connected.map((entry) => entry.state),
+      ['resolved', 'open'],
+    );
+  });
+
+  it('treats a thread without comments as an open finding instead of failing', () => {
+    const entries = [
+      { fingerprint: 'a', path: 'a.ts', title: 'One', state: 'open', commentId: 1 },
+    ];
+    assert.deepEqual(reconcileLedger(entries, [{ isResolved: false }], '/x'), entries);
+    assert.deepEqual(reconcileLedger(entries, undefined, '/x'), entries);
+    assert.deepEqual(asNodes({ nodes: [1, 2] }), [1, 2]);
+    assert.deepEqual(asNodes({ unexpected: true }), []);
+  });
+
+  it('records the thread state of a pull request whose threads arrive as connections', async () => {
+    const path = 'api/src/foo.ts';
+    const entry = {
+      fingerprint: fingerprintFinding({ path, title: 'Missing tenant filter' }),
+      path,
+      line: 12,
+      range: [10, 13],
+      severity: 'BUG',
+      title: 'Missing tenant filter',
+      state: 'open',
+      commentId: 555,
+    };
+    const calls = await runReviewFlow(
+      JSON.stringify({ summary: '', findings: [] }),
+      {
+        issueComments: [
+          { id: 900, body: buildLedgerBody({ entries: [entry] }), user: { type: 'Bot' } },
+        ],
+        graphql: {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: connection([
+                  {
+                    isResolved: true,
+                    comments: connection([
+                      {
+                        databaseId: 555,
+                        body: '**[BUG]** Missing tenant filter',
+                        author: { login: 'github-actions[bot]', __typename: 'Bot' },
+                      },
+                    ]),
+                  },
+                ]),
+              },
+            },
+          },
+        },
+      },
+    );
+
+    const patch = calls.find((call) => call.method === 'PATCH');
+    assert.ok(patch, 'the review state should be updated');
+    assert.match(patch.body.body, /resolved/);
+  });
+});
+
+describe('large diffs', () => {
+  const patchWith = (count) =>
+    [
+      '@@ -1,3 +1,4 @@',
+      ' const first = 1;',
+      ...Array.from(
+        { length: count },
+        (_, index) => ` const filler${index} = ${index};`,
+      ),
+      '-const removed = 2;',
+      '+const added = 2;',
+      '+const addedToo = 3;',
+      ' const tail = 4;',
+    ].join('\n');
+  const PATCH = patchWith(12);
+  const addedLine = [...addedLines(PATCH)][0];
+  const fileOf = (path) => ({ path, filename: path, patch: PATCH });
+  const findingFor = (path) => ({
+    severity: 'BUG',
+    path,
+    line: addedLine,
+    title: `Bug in ${path}`,
+    body: 'Fix it.',
+  });
+
+  it('keeps a diff that fits in one request in a single batch', () => {
+    const batches = planReviewBatches(
+      [fileOf('api/src/a.ts'), fileOf('api/src/b.ts')],
+      { maxDiffChars: 200_000 },
+    );
+    assert.equal(batches.length, 1);
+    assert.equal(batches[0].length, 2);
+  });
+
+  it('splits a diff over the budget into parts that each fit', () => {
+    const batches = planReviewBatches(
+      [fileOf('api/src/a.ts'), fileOf('api/src/b.ts'), fileOf('api/src/c.ts')],
+      { maxDiffChars: 700 },
+    );
+    assert.equal(batches.length, 3);
+    for (const batch of batches) {
+      const payload = buildDiffPayload(batch, { maxDiffChars: 700 });
+      assert.ok(payload.text.length <= 700);
+      assert.equal(payload.truncated, false);
+    }
+  });
+
+  it('reviews every part and merges the findings into one review', async () => {
+    const calls = await runReviewFlow(
+      [
+        JSON.stringify({
+          summary: 'The first part is fine.',
+          findings: [findingFor('api/src/a.ts')],
+        }),
+        JSON.stringify({
+          summary: 'The second part has a bug.',
+          findings: [findingFor('api/src/b.ts')],
+        }),
+      ],
+      {
+        files: [fileOf('api/src/a.ts'), fileOf('api/src/b.ts')],
+        maxDiffChars: 700,
+      },
+    );
+
+    const completions = calls.filter((call) =>
+      call.url.endsWith('/chat/completions'),
+    );
+    assert.equal(completions.length, 2);
+    assert.match(completions[1].body.messages[1].content, /this is part 2/);
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.comments.length, 2);
+    assert.equal(posted.body.event, 'REQUEST_CHANGES');
+    assert.match(posted.body.body, /reviewed in 2 parts/);
+    assert.match(posted.body.body, /The first part is fine\./);
+    assert.match(posted.body.body, /The second part has a bug\./);
+  });
+
+  it('stops at the request limit and names what was not reviewed', async () => {
+    const calls = await runReviewFlow(JSON.stringify({ findings: [] }), {
+      files: [
+        fileOf('api/src/a.ts'),
+        fileOf('api/src/b.ts'),
+        fileOf('api/src/c.ts'),
+      ],
+      maxDiffChars: 700,
+      maxBatches: 2,
+    });
+
+    const completions = calls.filter((call) =>
+      call.url.endsWith('/chat/completions'),
+    );
+    assert.equal(completions.length, 2);
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.match(posted.body.body, /1 shortened or skipped/);
+  });
+
+  it('reviews the other parts when one request is rejected', async () => {
+    const calls = await runReviewFlow(
+      [
+        { status: 500, message: 'upstream failed' },
+        JSON.stringify({ findings: [findingFor('api/src/b.ts')] }),
+      ],
+      {
+        files: [fileOf('api/src/a.ts'), fileOf('api/src/b.ts')],
+        maxDiffChars: 700,
+      },
+    );
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.comments.length, 1);
+    assert.equal(posted.body.event, 'REQUEST_CHANGES');
+    assert.match(posted.body.body, /1 part\(s\) of the diff could not be reviewed/);
+  });
+
+  it('reviews without its memory when the review state cannot be read', async () => {
+    const calls = await runReviewFlow(
+      JSON.stringify({ findings: [findingFor('api/src/a.ts')] }),
+      {
+        files: [fileOf('api/src/a.ts')],
+        issueComments: [{ id: 900, body: buildLedgerBody({ entries: [] }) }],
+        graphql: { status: 500, message: 'graphql down' },
+      },
+    );
+
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.comments.length, 1);
+    assert.equal(posted.body.event, 'REQUEST_CHANGES');
+  });
+
+  it('stops starting parts when the time budget is spent and keeps what it has', async () => {
+    const calls = await runReviewFlow(
+      [
+        JSON.stringify({ findings: [findingFor('api/src/a.ts')] }),
+        JSON.stringify({ findings: [findingFor('api/src/b.ts')] }),
+      ],
+      {
+        files: [fileOf('api/src/a.ts'), fileOf('api/src/b.ts')],
+        maxDiffChars: 700,
+        timeBudgetMinutes: 10,
+        // The first part takes longer than the whole budget.
+        advanceClockMs: 11 * 60 * 1000,
+      },
+    );
+
+    const completions = calls.filter((call) =>
+      call.url.endsWith('/chat/completions'),
+    );
+    assert.equal(completions.length, 1);
+    const posted = calls.find(
+      (call) => call.method === 'POST' && call.url.endsWith('/pulls/7/reviews'),
+    );
+    assert.equal(posted.body.comments.length, 1);
+    assert.match(posted.body.body, /time budget of 10 minutes was spent/);
+  });
+
+  it('caps a request timeout at the time left in the budget', () => {
+    const now = 1_000_000;
+    assert.equal(remainingTimeoutMs(now + 60_000, 900_000, now), 60_000);
+    assert.equal(remainingTimeoutMs(now + 900_000, 900_000, now), 900_000);
+    // Never negative, and never zero: a request needs its own minimum.
+    assert.equal(remainingTimeoutMs(now - 60_000, 900_000, now), 30_000);
   });
 });

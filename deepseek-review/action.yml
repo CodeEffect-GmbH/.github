@@ -30,6 +30,25 @@ inputs:
       the output budget would otherwise be spent on reasoning.
     required: false
     default: '80000'
+  max-diff-chars:
+    description: >-
+      Size of the diff a single review request may carry. A pull request whose diff is
+      larger is reviewed in several requests whose findings are merged into one review.
+    required: false
+    default: '200000'
+  max-batches:
+    description: >-
+      Highest number of review requests one run may spend on a large diff. Files beyond
+      it are reported in the review as not reviewed.
+    required: false
+    default: '6'
+  time-budget-minutes:
+    description: >-
+      Wall clock budget of a run. When it is spent, no further part of the diff is
+      requested and the review covers what was already answered. Keep it below the job
+      timeout.
+    required: false
+    default: '20'
   event:
     description: >-
       Review event used when the diff has findings. A diff without findings is
@@ -131,6 +150,9 @@ runs:
         DEEPSEEK_MODEL: ${{ inputs.model }}
         DEEPSEEK_THINKING: ${{ inputs.thinking }}
         REVIEW_THINKING_MAX_CHARS: ${{ inputs.thinking-max-chars }}
+        REVIEW_MAX_DIFF_CHARS: ${{ inputs.max-diff-chars }}
+        REVIEW_MAX_BATCHES: ${{ inputs.max-batches }}
+        REVIEW_TIME_BUDGET_MINUTES: ${{ inputs.time-budget-minutes }}
         REVIEW_EVENT: ${{ inputs.event }}
         REVIEW_INCLUDE_PATTERNS: ${{ inputs.include-patterns }}
         REVIEW_EXCLUDE_PATTERNS: ${{ inputs.exclude-patterns }}

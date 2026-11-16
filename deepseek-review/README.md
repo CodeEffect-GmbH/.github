@@ -97,6 +97,9 @@ Only the review policy: a markdown file that is sent as the repository specific 
 | `base-url` | `https://api.deepseek.com` | DeepSeek API endpoint. |
 | `thinking` | `enabled` | Reasoning mode. `disabled` makes reviews much faster and shallower. |
 | `thinking-max-chars` | `80000` | Diff size up to which reasoning is used. Above it the review runs without reasoning. |
+| `max-diff-chars` | `200000` | Size of the diff one request may carry. A larger diff is reviewed in several requests that are merged into one review. |
+| `max-batches` | `6` | Highest number of requests one run spends on a large diff. Files beyond it are reported as not reviewed. |
+| `time-budget-minutes` | `20` | Wall clock budget of a run. When it is spent, no further part is requested; keep it below the job timeout. |
 | `event` | `REQUEST_CHANGES` | Review event when a finding of a blocking severity exists. |
 | `include-patterns` | _empty_ | Comma separated globs the review is restricted to. |
 | `exclude-patterns` | lockfiles | Comma separated globs that are never reviewed. |
@@ -173,6 +176,15 @@ memory, which is the old behaviour.
   in a fraction of the time.
 - Degrades instead of failing when the answer is empty or the parameters are rejected: reasoning off, then
   half the diff, then a quarter without JSON mode. Every attempt is logged with the reason.
+- Reviews a diff that does not fit one request in parts: the changed files are grouped into requests of at
+  most `max-diff-chars` each (`max-batches` of them), every part is reviewed, and the findings of all parts
+  are merged into one review. A part that fails does not lose the others; files left out are named in the
+  review. Only a run in which every part fails is reported as failed.
+- Stops starting new parts once `time-budget-minutes` is spent, so a huge diff is reviewed as far as the
+  job timeout allows instead of being killed with nothing to show. Every request's own timeout is capped by
+  the time that is left.
+- Reads the review state defensively: the GraphQL connections (`{ nodes }`) and a plain list are both
+  accepted, and an unreadable ledger or thread list costs the memory of the review, never the review.
 - Skips automatic runs on drafts (a requested review reviews them) and pull requests whose title or body
   contains `skip cr` or `skip review`.
 - Skips files without a text diff, removed files and everything matched by `exclude-patterns`.
