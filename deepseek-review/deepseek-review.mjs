@@ -27,6 +27,7 @@
  */
 
 import { isAbsolute, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
@@ -123,6 +124,15 @@ export function readConfig() {
     extraContext: String(process.env.REVIEW_COMMENT ?? '')
       .trim()
       .slice(0, 4000),
+    // A review is only useful if it converges. The ledger remembers what was already
+    // reported and what the authors answered, so a later run cannot re-raise it.
+    ledger: String(process.env.REVIEW_LEDGER ?? 'on').toLowerCase() !== 'off',
+    ignoreDirective:
+      process.env.REVIEW_IGNORE_DIRECTIVE || '/deepseek-ignore',
+    breakerLabel: String(process.env.REVIEW_BREAKER_LABEL ?? '').trim(),
+    temperature: process.env.REVIEW_TEMPERATURE === undefined
+      ? 0
+      : Number(process.env.REVIEW_TEMPERATURE),
   };
 }
 
@@ -247,6 +257,40 @@ export function commentableLines(patch) {
     }
   }
   return { right, left };
+}
+
+/** Collects the new-file line numbers the diff actually adds. */
+export function addedLines(patch) {
+  const added = new Set();
+  for (const hunk of parseHunks(patch)) {
+    for (const line of hunk.lines) {
+      if (line.marker === '+' && line.newLine !== null) {
+        added.add(line.newLine);
+      }
+    }
+  }
+  return added;
+}
+
+/**
+ * The new-file span of the hunk a line belongs to. Two findings in the same hunk are
+ * treated as talking about the same code, which is what the oscillation check needs.
+ */
+export function hunkRange(patch, line) {
+  for (const hunk of parseHunks(patch)) {
+    const numbers = hunk.lines
+      .map((entry) => entry.newLine)
+      .filter((entry) => entry !== null);
+    if (numbers.length === 0) {
+      continue;
+    }
+    const start = Math.min(...numbers);
+    const end = Math.max(...numbers);
+    if (line >= start && line <= end) {
+      return [start, end];
+    }
+  }
+  return [line, line];
 }
 
 /**
@@ -415,6 +459,10 @@ export function normalizeFindings(rawFindings, files, options = {}) {
   const linesByPath = new Map(
     files.map((file) => [file.path, commentableLines(file.patch)]),
   );
+  const addedByPath = new Map(
+    files.map((file) => [file.path, addedLines(file.patch)]),
+  );
+  const patchByPath = new Map(files.map((file) => [file.path, file.patch]));
   const comments = [];
   const demoted = [];
   const seen = new Set();
@@ -469,7 +517,19 @@ export function normalizeFindings(rawFindings, files, options = {}) {
       continue;
     }
     seen.add(key);
-    comments.push({ path, side, line, severity, title, body: text });
+    comments.push({
+      path,
+      side,
+      line,
+      severity,
+      title,
+      body: text,
+      // Only a line the diff adds can turn into a change request: reporting on
+      // context lines is how a review ends up demanding changes to code this pull
+      // request never touched.
+      added: side === 'RIGHT' && addedByPath.get(path).has(line),
+      range: hunkRange(patchByPath.get(path), line),
+    });
   }
 
   comments.sort(
@@ -539,6 +599,166 @@ export function parseModelOutput(text) {
 export function formatComment({ severity, title, body }) {
   const heading = title ? `**[${severity}]** ${title}` : `**[${severity}]**`;
   return body ? `${heading}\n\n${body}` : heading;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Review ledger                                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The ledger is the memory of a review: one sticky comment per pull request that
+ * records every finding, its fingerprint and what happened to it. Without it each run
+ * is a fresh opinion, which is how a reviewer ends up asking for the opposite of what
+ * it asked for on the previous push.
+ */
+export const LEDGER_MARKER = '<!-- deepseek-review-ledger:v1';
+
+/** Stable identity of a finding; the title is reduced to its sorted words. */
+export function fingerprintFinding({ path, title }) {
+  const words = String(title ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .sort()
+    .slice(0, 12)
+    .join(' ');
+  return createHash('sha1')
+    .update(`${path}|${words}`)
+    .digest('hex')
+    .slice(0, 12);
+}
+
+/** Reads the ignore directive out of a comment body, if it is there. */
+export function readIgnoreDirective(body, directive) {
+  const text = String(body ?? '');
+  const index = text.indexOf(directive);
+  if (index === -1) {
+    return null;
+  }
+  const reason = text.slice(index + directive.length).split('\n')[0].trim();
+  return reason || 'ignored by the author';
+}
+
+const isBotAuthor = (author) =>
+  author?.__typename === 'Bot' ||
+  String(author?.login ?? '').endsWith('[bot]') ||
+  String(author?.login ?? '') === 'github-actions';
+
+/**
+ * Turns recorded findings into their current state: resolved threads are done, a human
+ * reply makes a finding answered, and a reply carrying the ignore directive settles it
+ * as "will not fix".
+ */
+export function reconcileLedger(entries, threads, directive) {
+  const threadByCommentId = new Map();
+  for (const thread of threads ?? []) {
+    for (const comment of thread.comments ?? []) {
+      threadByCommentId.set(Number(comment.databaseId), thread);
+    }
+  }
+
+  return (entries ?? []).map((entry) => {
+    const thread = entry.commentId
+      ? threadByCommentId.get(Number(entry.commentId))
+      : null;
+    if (!thread) {
+      return entry;
+    }
+    const replies = (thread.comments ?? []).filter(
+      (comment) =>
+        Number(comment.databaseId) !== Number(entry.commentId) &&
+        !isBotAuthor(comment.author),
+    );
+    const ignored = replies
+      .map((reply) => readIgnoreDirective(reply.body, directive))
+      .find((reason) => reason !== null);
+    if (ignored) {
+      return { ...entry, state: 'wontfix', note: ignored };
+    }
+    if (thread.isResolved) {
+      return { ...entry, state: 'resolved' };
+    }
+    if (replies.length > 0) {
+      return {
+        ...entry,
+        state: 'answered',
+        note: String(replies[replies.length - 1].body ?? '').slice(0, 300),
+      };
+    }
+    return entry;
+  });
+}
+
+/** The recorded finding with this fingerprint, if there is one. */
+export function findKnown(entries, fingerprint) {
+  return (entries ?? []).find((entry) => entry.fingerprint === fingerprint) ?? null;
+}
+
+/**
+ * Settled findings whose hunk overlaps the given one. A new finding on code that was
+ * already discussed is exactly what makes a review oscillate, so it may be reported
+ * but must not turn into another change request.
+ */
+export function findAnsweredOverlap(entries, finding) {
+  return (entries ?? []).filter(
+    (entry) =>
+      entry.path === finding.path &&
+      entry.state !== 'open' &&
+      Array.isArray(entry.range) &&
+      entry.range[0] <= finding.range[1] &&
+      finding.range[0] <= entry.range[1],
+  );
+}
+
+/** Renders the sticky comment: a readable table plus the machine-readable ledger. */
+export function buildLedgerBody({ entries, summary = '', limit = 50 }) {
+  const kept = (entries ?? []).slice(-limit);
+  const lines = ['### DeepSeek review state', ''];
+  if (summary) {
+    lines.push(summary, '');
+  }
+  if (kept.length === 0) {
+    lines.push('No findings recorded yet.');
+  } else {
+    lines.push(
+      '| Severity | Finding | Where | State |',
+      '| --- | --- | --- | --- |',
+    );
+    for (const entry of kept) {
+      const note = entry.note
+        ? `: ${String(entry.note).replace(/\|/g, '\\|').slice(0, 120)}`
+        : '';
+      lines.push(
+        `| ${entry.severity} | ${String(entry.title).replace(/\|/g, '\\|')} | \`${entry.path}:${entry.line ?? '-'}\` | ${entry.state}${note} |`,
+      );
+    }
+  }
+  lines.push(
+    '',
+    '<sub>This comment is the memory of the automated review and is rewritten on every run. Resolving a thread or replying settles a finding; reply with the ignore directive to record a decision that must not be raised again.</sub>',
+    '',
+    LEDGER_MARKER,
+    JSON.stringify(kept),
+    '-->',
+  );
+  return lines.join('\n');
+}
+
+/** Reads the ledger back out of the sticky comment, tolerating a damaged body. */
+export function parseLedgerBody(body) {
+  const text = String(body ?? '');
+  const start = text.indexOf(LEDGER_MARKER);
+  const end = start === -1 ? -1 : text.indexOf('-->', start);
+  if (start === -1 || end === -1) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(text.slice(start + LEDGER_MARKER.length, end).trim());
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -652,7 +872,13 @@ export async function loadPolicy(config, options = {}) {
   return { policy: '', policySource: '' };
 }
 
-export function buildUserPrompt({ payload, pullRequest, extraContext = '' }) {
+export function buildUserPrompt({
+  payload,
+  pullRequest,
+  extraContext = '',
+  previousFindings = [],
+  ignoreDirective = '/deepseek-ignore',
+}) {
   const parts = [
     `Review pull request #${pullRequest.number}: ${pullRequest.title}`,
     '',
@@ -661,6 +887,27 @@ export function buildUserPrompt({ payload, pullRequest, extraContext = '' }) {
     '',
     payload.text,
   ];
+  const recorded = (previousFindings ?? []).filter(
+    (entry) => entry && entry.state !== 'open',
+  );
+  if (recorded.length > 0) {
+    parts.push(
+      '',
+      'Previous reviews of this pull request. These were already reported and have been',
+      'settled - do not report them again in this or another wording:',
+      ...recorded.map(
+        (entry) =>
+          `- [${entry.severity}] ${entry.path}:${entry.line ?? '-'} "${entry.title}" -> ${entry.state}${entry.note ? `: ${String(entry.note).slice(0, 200)}` : ''}`,
+      ),
+      '',
+      'Rules for a re-review:',
+      '- Do not repeat a recorded finding, and do not ask for the opposite of a change',
+      '  that was already requested and settled.',
+      '- If you now believe an earlier request was wrong, say so in the summary and',
+      '  explain why; do not silently request a revert.',
+      `- A decision the authors marked with ${ignoreDirective} is final: do not raise it`, '  again.',
+    );
+  }
   if (payload.truncated) {
     parts.push(
       '',
@@ -726,7 +973,40 @@ function createGitHubClient(config) {
     return payload;
   }
 
-  return { request };
+  /**
+   * The review threads - which is where the resolution state of a finding lives -
+   * are only available through GraphQL.
+   */
+  async function graphql(query, variables) {
+    const response = await fetch(`${GITHUB_API}/graphql`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${config.githubToken}`,
+        accept: 'application/vnd.github+json',
+        'content-type': 'application/json',
+        'user-agent': 'deepseek-pr-review',
+      },
+      body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    const text = await response.text();
+    let payload = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = null;
+    }
+    if (!response.ok || payload?.errors) {
+      throw new Error(
+        `GitHub GraphQL failed with ${response.status}: ${JSON.stringify(
+          payload?.errors ?? payload,
+        ).slice(0, 300)}`,
+      );
+    }
+    return payload;
+  }
+
+  return { request, graphql };
 }
 
 async function getPullRequest(client, config) {
@@ -776,6 +1056,119 @@ async function readRepoFile(client, config, path, ref) {
 export function shouldSkip(pullRequest) {
   const text = `${pullRequest.title ?? ''}\n${pullRequest.body ?? ''}`;
   return /\bskip\s+(cr|review)\b/i.test(text);
+}
+
+/** Loads the sticky ledger comment of this pull request, if there is one. */
+async function loadLedger(client, config) {
+  let comments = [];
+  try {
+    comments = await client.request(
+      `/repos/${config.repository}/issues/${config.prNumber}/comments?per_page=100`,
+    );
+  } catch (error) {
+    // The ledger is an improvement, not a requirement: a token without issue access
+    // must still be able to review.
+    log(`Could not read the review state: ${error.message}`);
+    return { commentId: null, entries: [] };
+  }
+  const ledgerComment = (Array.isArray(comments) ? comments : [])
+    .filter((comment) => String(comment.body ?? '').includes(LEDGER_MARKER))
+    .sort((left, right) =>
+      String(left.created_at).localeCompare(String(right.created_at)),
+    )
+    .pop();
+  return {
+    commentId: ledgerComment?.id ?? null,
+    entries: ledgerComment ? parseLedgerBody(ledgerComment.body) : [],
+  };
+}
+
+/** Creates or rewrites the sticky ledger comment. */
+async function saveLedger(client, config, commentId, body) {
+  try {
+    if (commentId) {
+      await client.request(
+        `/repos/${config.repository}/issues/comments/${commentId}`,
+        { method: 'PATCH', body: { body } },
+      );
+      return commentId;
+    }
+    const created = await client.request(
+      `/repos/${config.repository}/issues/${config.prNumber}/comments`,
+      { method: 'POST', body: { body } },
+    );
+    return created?.id ?? null;
+  } catch (error) {
+    log(`Could not write the review state: ${error.message}`);
+    return commentId;
+  }
+}
+
+/** Reads the resolution state of every review thread on the pull request. */
+async function reviewThreads(client, config) {
+  const query = [
+    'query($owner:String!,$name:String!,$number:Int!){',
+    ' repository(owner:$owner,name:$name){pullRequest(number:$number){',
+    '  reviewThreads(first:100){nodes{isResolved comments(first:30){nodes{',
+    '   databaseId body author{login __typename}',
+    '  }}}}',
+    ' }}}',
+  ].join('\n');
+  const [owner, name] = config.repository.split('/');
+  try {
+    const payload = await client.graphql(query, {
+      owner,
+      name,
+      number: Number(config.prNumber),
+    });
+    return (
+      payload?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? []
+    );
+  } catch (error) {
+    log(`Could not read the review threads: ${error.message}`);
+    return [];
+  }
+}
+
+/** Matches the comments this run posted with their ids, for the ledger. */
+async function linkCommentIds(client, config, findings) {
+  if (findings.length === 0) {
+    return findings;
+  }
+  let comments = [];
+  try {
+    comments = await client.request(
+      `/repos/${config.repository}/pulls/${config.prNumber}/comments?per_page=100`,
+    );
+  } catch (error) {
+    log(`Could not read the review comments: ${error.message}`);
+  }
+  const idByBody = new Map(
+    (Array.isArray(comments) ? comments : []).map((comment) => [
+      String(comment.body ?? '').trim(),
+      comment.id,
+    ]),
+  );
+  return findings.map((finding) => ({
+    ...finding,
+    commentId: idByBody.get(formatComment(finding).trim()) ?? null,
+  }));
+}
+
+/** Adds the configured escalation label, best effort. */
+async function addLabel(client, config, label) {
+  if (!label) {
+    return;
+  }
+  try {
+    await client.request(
+      `/repos/${config.repository}/issues/${config.prNumber}/labels`,
+      { method: 'POST', body: { labels: [label] } },
+    );
+    log(`Added the "${label}" label: the review is not converging.`);
+  } catch (error) {
+    log(`Could not add the "${label}" label: ${error.message}`);
+  }
 }
 
 /**
@@ -953,6 +1346,12 @@ async function requestReview({
     if (step.format) {
       body.response_format = { type: 'json_object' };
     }
+    // A deterministic answer is part of converging: the same diff should not produce a
+    // different opinion on every run. Only the first attempt pins it, the retries stay
+    // as unconstrained as the provider allows.
+    if (index === 0 && Number.isFinite(config.temperature)) {
+      body.temperature = config.temperature;
+    }
     try {
       if (index > 0) {
         log(
@@ -985,6 +1384,8 @@ export function buildReviewBody({
   usage,
   model,
   blocking = true,
+  repeated = 0,
+  oscillating = [],
 }) {
   const lines = [];
   const count = comments.length + demoted.length;
@@ -995,6 +1396,22 @@ export function buildReviewBody({
   );
   if (summary) {
     lines.push('', summary);
+  }
+  if (repeated > 0) {
+    lines.push(
+      '',
+      `> ${repeated} finding(s) from an earlier review were left out: they are already`,
+      '> recorded in the review state comment with their outcome.',
+    );
+  }
+  if (oscillating.length > 0) {
+    lines.push(
+      '',
+      `> ${oscillating.length} new finding(s) sit on code that was already discussed and`,
+      '> settled. They are reported as comments, not as a change request, because a review',
+      '> that keeps finding new problems on the same lines does not converge. A human',
+      '> decision is needed here.',
+    );
   }
   if (!blocking && count > 0) {
     lines.push(
@@ -1083,6 +1500,25 @@ export async function main() {
   const { policy, policySource } = await loadPolicy(config, {
     readFromRepo: (candidate) => readRepoFile(client, config, candidate, baseSha),
   });
+
+  // What earlier runs reported and what the authors did about it. This is what keeps
+  // a re-review from re-raising settled findings or asking for their opposite.
+  let ledgerEntries = [];
+  let ledgerCommentId = null;
+  if (config.ledger) {
+    const ledger = await loadLedger(client, config);
+    ledgerCommentId = ledger.commentId;
+    ledgerEntries = reconcileLedger(
+      ledger.entries,
+      await reviewThreads(client, config),
+      config.ignoreDirective,
+    );
+    const settled = ledgerEntries.filter((entry) => entry.state !== 'open');
+    log(
+      `Ledger: ${ledgerEntries.length} recorded finding(s), ${settled.length} settled.`,
+    );
+  }
+
   const allowThinking =
     Boolean(config.thinking) && payload.text.length <= config.thinkingMaxChars;
   log(
@@ -1108,6 +1544,8 @@ export async function main() {
               }),
         pullRequest,
         extraContext: config.extraContext,
+        previousFindings: ledgerEntries,
+        ignoreDirective: config.ignoreDirective,
       }),
   });
   const parsed = parseModelOutput(response.text);
@@ -1126,25 +1564,54 @@ export async function main() {
     return;
   }
 
-  const blockingFindings = [...comments, ...demoted].filter((finding) =>
-    config.blockSeverities.includes(finding.severity),
+  // A finding already on record is not reported again; a new one on code that was
+  // discussed and settled may be reported but never becomes another change request.
+  for (const finding of comments) {
+    finding.fingerprint = fingerprintFinding(finding);
+    finding.overlap = findAnsweredOverlap(ledgerEntries, finding);
+  }
+  const repeated = comments.filter((finding) =>
+    findKnown(ledgerEntries, finding.fingerprint),
+  );
+  const fresh = comments.filter(
+    (finding) => !findKnown(ledgerEntries, finding.fingerprint),
+  );
+  const oscillating = fresh.filter((finding) => finding.overlap.length > 0);
+  if (repeated.length > 0) {
+    log(
+      `${repeated.length} finding(s) already on record were not reported again.`,
+    );
+  }
+  if (oscillating.length > 0) {
+    log(
+      `${oscillating.length} finding(s) are on code that was already settled - reported without a change request.`,
+    );
+  }
+
+  const blockingFindings = fresh.filter(
+    (finding) =>
+      config.blockSeverities.includes(finding.severity) &&
+      finding.added &&
+      finding.overlap.length === 0,
   );
   const mustRequestChanges = blockingFindings.length > 0;
   log(
     mustRequestChanges
-      ? `${comments.length} inline finding(s), ${blockingFindings.length} of a blocking severity, requesting changes.`
-      : `${comments.length} inline finding(s), none of a blocking severity.`,
+      ? `${fresh.length} new inline finding(s), ${blockingFindings.length} blocking, requesting changes.`
+      : `${fresh.length} new inline finding(s), none of them blocking.`,
   );
 
   const body = buildReviewBody({
     pullRequest,
     summary: parsed.summary,
-    comments,
+    comments: fresh,
     demoted,
     payload,
     usage: response.usage,
     model: response.model,
     blocking: mustRequestChanges,
+    repeated: repeated.length,
+    oscillating,
   });
   const event =
     parsed.unparsed || !mustRequestChanges ? 'COMMENT' : config.event;
@@ -1154,7 +1621,7 @@ export async function main() {
     commitId: pullRequest.head.sha,
     event,
     body,
-    comments: comments.map((comment) => ({
+    comments: fresh.map((comment) => ({
       path: comment.path,
       line: comment.line,
       side: comment.side,
@@ -1162,8 +1629,37 @@ export async function main() {
     })),
   });
   log(
-    `Submitted a review with ${comments.length} inline comment(s) as ${event}.`,
+    `Submitted a review with ${fresh.length} inline comment(s) as ${event}.`,
   );
+
+  if (config.ledger) {
+    const linked = await linkCommentIds(client, config, fresh);
+    const at = new Date().toISOString();
+    const entries = [
+      ...ledgerEntries,
+      ...linked.map((finding) => ({
+        fingerprint: finding.fingerprint,
+        path: finding.path,
+        line: finding.line,
+        range: finding.range,
+        severity: finding.severity,
+        title: finding.title,
+        state: 'open',
+        commentId: finding.commentId,
+        firstSeen: at,
+        lastSeen: at,
+      })),
+    ];
+    await saveLedger(
+      client,
+      config,
+      ledgerCommentId,
+      buildLedgerBody({ entries, summary: parsed.summary }),
+    );
+    if (oscillating.length > 0) {
+      await addLabel(client, config, config.breakerLabel);
+    }
+  }
 
   const summaryFile = process.env.GITHUB_STEP_SUMMARY;
   if (summaryFile) {

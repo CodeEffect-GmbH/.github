@@ -53,6 +53,29 @@ inputs:
       never request changes.
     required: false
     default: BUG,SECURITY,BREAKING
+  ledger:
+    description: >-
+      Remember what was already reported and how it was answered in a sticky comment,
+      so a re-review cannot repeat a settled finding or ask for its opposite. Needs
+      `issues: write`; without it the review runs without this memory.
+    required: false
+    default: 'on'
+  ignore-directive:
+    description: >-
+      Phrase that settles a finding when it appears in a reply, e.g. a decision the
+      reviewer must not raise again.
+    required: false
+    default: /deepseek-ignore
+  breaker-label:
+    description: >-
+      Label added when a run finds new problems on code that was already settled,
+      i.e. when the review is not converging. Empty disables the label.
+    required: false
+    default: ai-review:needs-decision
+  temperature:
+    description: Temperature of the first request, so repeated runs agree.
+    required: false
+    default: '0'
   policy-file:
     description: >-
       Repository relative path of the markdown file holding the review policy of
@@ -112,6 +135,10 @@ runs:
         REVIEW_INCLUDE_PATTERNS: ${{ inputs.include-patterns }}
         REVIEW_EXCLUDE_PATTERNS: ${{ inputs.exclude-patterns }}
         REVIEW_BLOCK_SEVERITIES: ${{ inputs.block-severities }}
+        REVIEW_LEDGER: ${{ inputs.ledger }}
+        REVIEW_IGNORE_DIRECTIVE: ${{ inputs.ignore-directive }}
+        REVIEW_BREAKER_LABEL: ${{ inputs.breaker-label }}
+        REVIEW_TEMPERATURE: ${{ inputs.temperature }}
         REVIEW_POLICY_FILE: ${{ inputs.policy-file }}
         REVIEW_POLICY_FALLBACK_FILES: ${{ inputs.policy-fallback-files }}
         # A comment that asks for a review also reviews a draft; a run triggered by
