@@ -105,6 +105,12 @@ export function readConfig() {
     ),
     maxDiffChars: toInt(process.env.REVIEW_MAX_DIFF_CHARS, 200_000),
     maxFileChars: toInt(process.env.REVIEW_MAX_FILE_CHARS, 40_000),
+    // A diff that does not fit one request is reviewed in parts, one request each.
+    // The cap keeps a huge pull request from spending the whole job on reviews.
+    maxBatches: Math.max(1, toInt(process.env.REVIEW_MAX_BATCHES, 6)),
+    // Reviewing in parts multiplies the time a run needs, so the run stops starting
+    // new parts when this budget is spent instead of being killed by the job timeout.
+    timeBudgetMs: Math.max(1, toInt(process.env.REVIEW_TIME_BUDGET_MINUTES, 20)) * 60_000,
     // Reasoning above this diff size is what produced empty answers: the whole output
     // budget went into reasoning and no review was left. Big diffs are reviewed
     // without reasoning, which is also much faster.
@@ -363,6 +369,39 @@ export function buildDiffPayload(files, options = {}) {
     omitted,
     truncated: omitted.length > 0,
   };
+}
+
+/**
+ * Splits the changed files into review requests that each fit the diff budget.
+ *
+ * A diff that is too large for one request used to be silently truncated, and a
+ * request the provider rejected as too big failed the whole run. Grouping the files
+ * up front means every file is reviewed by a request small enough to answer, and the
+ * findings of all parts are merged afterwards.
+ */
+export function planReviewBatches(files, options = {}) {
+  const maxDiffChars = options.maxDiffChars ?? 200_000;
+  const maxFileChars = options.maxFileChars ?? 40_000;
+  const batches = [];
+  let current = [];
+  let used = 0;
+
+  for (const file of files) {
+    const size =
+      annotatePatch(file.path, file.patch, { maxChars: maxFileChars }).text
+        .length + 2;
+    if (current.length > 0 && used + size > maxDiffChars) {
+      batches.push(current);
+      current = [];
+      used = 0;
+    }
+    current.push(file);
+    used += size;
+  }
+  if (current.length > 0) {
+    batches.push(current);
+  }
+  return batches;
 }
 
 /** Selects the changed files that are in scope for the review. */
@@ -646,26 +685,42 @@ const isBotAuthor = (author) =>
   String(author?.login ?? '') === 'github-actions';
 
 /**
+ * Reads a list of nodes.
+ *
+ * The review threads and their comments are GraphQL connections, so the payload is
+ * `{ nodes: [...] }` and not an array - iterating it directly is what used to take the
+ * whole review down with "object is not iterable". Everything that reads them goes
+ * through here, so a plain array (a REST payload, a test fixture) works just as well
+ * and an unexpected shape degrades to "no threads" instead of a failed run.
+ */
+export const asNodes = (value) => {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  return Array.isArray(value?.nodes) ? value.nodes : [];
+};
+
+/**
  * Turns recorded findings into their current state: resolved threads are done, a human
  * reply makes a finding answered, and a reply carrying the ignore directive settles it
  * as "will not fix".
  */
 export function reconcileLedger(entries, threads, directive) {
   const threadByCommentId = new Map();
-  for (const thread of threads ?? []) {
-    for (const comment of thread.comments ?? []) {
+  for (const thread of asNodes(threads)) {
+    for (const comment of asNodes(thread?.comments)) {
       threadByCommentId.set(Number(comment.databaseId), thread);
     }
   }
 
-  return (entries ?? []).map((entry) => {
+  return (Array.isArray(entries) ? entries : []).map((entry) => {
     const thread = entry.commentId
       ? threadByCommentId.get(Number(entry.commentId))
       : null;
     if (!thread) {
       return entry;
     }
-    const replies = (thread.comments ?? []).filter(
+    const replies = asNodes(thread.comments).filter(
       (comment) =>
         Number(comment.databaseId) !== Number(entry.commentId) &&
         !isBotAuthor(comment.author),
@@ -878,15 +933,23 @@ export function buildUserPrompt({
   extraContext = '',
   previousFindings = [],
   ignoreDirective = '/deepseek-ignore',
+  part = null,
 }) {
   const parts = [
     `Review pull request #${pullRequest.number}: ${pullRequest.title}`,
     '',
     `The diff covers ${payload.reviewed.length} changed file(s). The left column of`,
     'each diff line is the line number in the new version of the file.',
-    '',
-    payload.text,
   ];
+  if (part && part.total > 1) {
+    parts.push(
+      '',
+      `This diff is too large for a single request, so it is reviewed in ${part.total}`,
+      `parts and this is part ${part.index}. Report only on the files shown here; the`,
+      'other parts are reviewed separately.',
+    );
+  }
+  parts.push('', payload.text);
   const recorded = (previousFindings ?? []).filter(
     (entry) => entry && entry.state !== 'open',
   );
@@ -1121,9 +1184,14 @@ async function reviewThreads(client, config) {
       name,
       number: Number(config.prNumber),
     });
-    return (
-      payload?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? []
-    );
+    // The comments of a thread are a connection as well, so the payload is flattened
+    // here - once - and every consumer below can treat it as a plain list.
+    return asNodes(
+      payload?.data?.repository?.pullRequest?.reviewThreads?.nodes,
+    ).map((thread) => ({
+      isResolved: Boolean(thread?.isResolved),
+      comments: asNodes(thread?.comments),
+    }));
   } catch (error) {
     log(`Could not read the review threads: ${error.message}`);
     return [];
@@ -1137,8 +1205,10 @@ async function linkCommentIds(client, config, findings) {
   }
   let comments = [];
   try {
+    // Newest first: the comments of this run are the ones being linked, and a pull
+    // request with more than one page of comments would otherwise lose them.
     comments = await client.request(
-      `/repos/${config.repository}/pulls/${config.prNumber}/comments?per_page=100`,
+      `/repos/${config.repository}/pulls/${config.prNumber}/comments?per_page=100&sort=created&direction=desc`,
     );
   } catch (error) {
     log(`Could not read the review comments: ${error.message}`);
@@ -1251,7 +1321,14 @@ async function submitReview(client, config, review) {
 /* DeepSeek API                                                               */
 /* -------------------------------------------------------------------------- */
 
-async function postCompletion(config, body) {
+/**
+ * Time left for a request: the run's budget, capped by the provider's own limit.
+ * Keeps a request from outliving the budget and the job timeout with it.
+ */
+export const remainingTimeoutMs = (deadline, maxMs = 900_000, now = Date.now()) =>
+  Math.max(30_000, Math.min(maxMs, deadline - now));
+
+async function postCompletion(config, body, timeoutMs = 900_000) {
   const response = await fetch(`${config.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -1260,7 +1337,7 @@ async function postCompletion(config, body) {
       'user-agent': 'deepseek-pr-review',
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(900_000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await response.text();
   if (!response.ok) {
@@ -1322,6 +1399,7 @@ async function requestReview({
   systemPrompt,
   allowThinking,
   buildUserPrompt,
+  deadline,
 }) {
   const ladder = [
     { thinking: allowThinking ? 'enabled' : 'disabled', fraction: 1, format: true },
@@ -1359,11 +1437,21 @@ async function requestReview({
             `${step.format ? '' : ', no json mode'}.`,
         );
       }
-      return await postCompletion(config, body);
+      return await postCompletion(
+        config,
+        body,
+        remainingTimeoutMs(deadline ?? Date.now() + 900_000),
+      );
     } catch (error) {
       lastError = error;
       log(`Request attempt ${index + 1} failed: ${error.message}`);
-      if (error.status && error.status !== 400 && error.status !== 422) {
+      // 400/413/422 are the provider saying "this request is too big or too odd",
+      // which a smaller diff and no json mode can still satisfy. Everything else
+      // (a rejected key, an outage) fails the same way on every attempt.
+      if (
+        error.status &&
+        ![400, 413, 422].includes(Number(error.status))
+      ) {
         break;
       }
     }
@@ -1386,6 +1474,8 @@ export function buildReviewBody({
   blocking = true,
   repeated = 0,
   oscillating = [],
+  batches = 1,
+  failed = [],
 }) {
   const lines = [];
   const count = comments.length + demoted.length;
@@ -1431,6 +1521,21 @@ export function buildReviewBody({
         lines.push(`  ${finding.body}`);
       }
     }
+  }
+  if (batches > 1) {
+    lines.push(
+      '',
+      `> The diff was too large for a single request, so it was reviewed in ${batches} parts`,
+      '> whose findings are merged here.',
+    );
+  }
+  if (failed.length > 0) {
+    lines.push(
+      '',
+      `> ${failed.length} part(s) of the diff could not be reviewed, so this review does`,
+      '> not cover them:',
+      ...failed.map((entry) => `> - ${entry}`),
+    );
   }
   if (payload.truncated) {
     lines.push(
@@ -1492,9 +1597,9 @@ export async function main() {
     return;
   }
 
-  const payload = buildDiffPayload(selected, config);
+  const measured = buildDiffPayload(selected, config);
   log(
-    `Reviewing ${payload.reviewed.length} file(s), ${payload.text.length} characters.`,
+    `Diff: ${measured.reviewed.length} file(s), ${measured.text.length} characters.`,
   );
 
   const { policy, policySource } = await loadPolicy(config, {
@@ -1502,58 +1607,157 @@ export async function main() {
   });
 
   // What earlier runs reported and what the authors did about it. This is what keeps
-  // a re-review from re-raising settled findings or asking for their opposite.
+  // a re-review from re-raising settled findings or asking for their opposite. It is
+  // bookkeeping: when it cannot be read, the review still runs - without its memory.
   let ledgerEntries = [];
   let ledgerCommentId = null;
   if (config.ledger) {
-    const ledger = await loadLedger(client, config);
-    ledgerCommentId = ledger.commentId;
-    ledgerEntries = reconcileLedger(
-      ledger.entries,
-      await reviewThreads(client, config),
-      config.ignoreDirective,
-    );
-    const settled = ledgerEntries.filter((entry) => entry.state !== 'open');
+    try {
+      const ledger = await loadLedger(client, config);
+      ledgerCommentId = ledger.commentId;
+      ledgerEntries = reconcileLedger(
+        ledger.entries,
+        await reviewThreads(client, config),
+        config.ignoreDirective,
+      );
+      const settled = ledgerEntries.filter((entry) => entry.state !== 'open');
+      log(
+        `Ledger: ${ledgerEntries.length} recorded finding(s), ${settled.length} settled.`,
+      );
+    } catch (error) {
+      ledgerEntries = [];
+      log(`Review state unavailable, reviewing without it: ${error.message}`);
+    }
+  }
+
+  // A diff can be larger than one request can hold. Reviewing it in parts keeps every
+  // file in front of the model instead of shortening the diff until the request fits.
+  const batches = planReviewBatches(selected, config);
+  const reviewedBatches = batches.slice(0, config.maxBatches);
+  const droppedBatches = batches.slice(config.maxBatches);
+  log(
+    `Reviewing in ${reviewedBatches.length} request(s).`,
+  );
+  for (const dropped of droppedBatches) {
     log(
-      `Ledger: ${ledgerEntries.length} recorded finding(s), ${settled.length} settled.`,
+      `Not reviewed, over the limit of ${config.maxBatches} requests: ${dropped
+        .map((file) => file.path)
+        .join(', ')}.`,
     );
   }
 
-  const allowThinking =
-    Boolean(config.thinking) && payload.text.length <= config.thinkingMaxChars;
-  log(
-    allowThinking
-      ? `Reasoning enabled for ${payload.text.length} characters of diff.`
-      : `Reasoning disabled: ${payload.text.length} characters of diff, threshold ${config.thinkingMaxChars}.`,
-  );
-  const response = await requestReview({
-    config,
-    systemPrompt: composeSystemPrompt({ policy, policySource }),
-    allowThinking,
-    buildUserPrompt: (fraction) =>
-      buildUserPrompt({
-        payload:
-          fraction >= 1
-            ? payload
-            : buildDiffPayload(selected, {
-                ...config,
-                maxDiffChars: Math.max(
-                  5_000,
-                  Math.round(payload.text.length * fraction),
-                ),
-              }),
-        pullRequest,
-        extraContext: config.extraContext,
-        previousFindings: ledgerEntries,
-        ignoreDirective: config.ignoreDirective,
-      }),
-  });
-  const parsed = parseModelOutput(response.text);
-  const { comments, demoted } = normalizeFindings(parsed.findings, selected, {
+  const systemPrompt = composeSystemPrompt({ policy, policySource });
+  const rawFindings = [];
+  const summaries = [];
+  const reviewedPaths = [];
+  const omittedPaths = [];
+  const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  const failures = [];
+  const deadline = Date.now() + config.timeBudgetMs;
+  let answered = 0;
+  let model = config.model;
+  let unparsed = false;
+
+  for (const [index, batch] of reviewedBatches.entries()) {
+    if (index > 0 && Date.now() >= deadline) {
+      // The job has a timeout of its own; starting another part now would be killed
+      // half way and lose the review that is already paid for.
+      const skipped = reviewedBatches.slice(index).flat().length;
+      failures.push(
+        `${skipped} file(s) from part ${index + 1} on: the time budget of ${Math.round(
+          config.timeBudgetMs / 60_000,
+        )} minutes was spent`,
+      );
+      log(`Stopping after part ${index}: the time budget is spent.`);
+      break;
+    }
+    const batchPayload = buildDiffPayload(batch, config);
+    reviewedPaths.push(...batchPayload.reviewed);
+    omittedPaths.push(...batchPayload.omitted);
+    const allowThinking =
+      Boolean(config.thinking) &&
+      batchPayload.text.length <= config.thinkingMaxChars;
+    log(
+      `Part ${index + 1}/${reviewedBatches.length}: ${batchPayload.reviewed.length} file(s), ` +
+        `${batchPayload.text.length} characters, reasoning ${allowThinking ? 'on' : 'off'}.`,
+    );
+    try {
+      const response = await requestReview({
+        config,
+        systemPrompt,
+        allowThinking,
+        deadline,
+        buildUserPrompt: (fraction) =>
+          buildUserPrompt({
+            payload:
+              fraction >= 1
+                ? batchPayload
+                : buildDiffPayload(batch, {
+                    ...config,
+                    maxDiffChars: Math.max(
+                      5_000,
+                      Math.round(batchPayload.text.length * fraction),
+                    ),
+                  }),
+            pullRequest,
+            extraContext: config.extraContext,
+            previousFindings: ledgerEntries,
+            ignoreDirective: config.ignoreDirective,
+            part: { index: index + 1, total: reviewedBatches.length },
+          }),
+      });
+      const parsedBatch = parseModelOutput(response.text);
+      answered += 1;
+      unparsed = unparsed || parsedBatch.unparsed;
+      rawFindings.push(...parsedBatch.findings);
+      if (parsedBatch.summary) {
+        summaries.push(parsedBatch.summary);
+      }
+      model = response.model;
+      for (const key of ['prompt_tokens', 'completion_tokens', 'total_tokens']) {
+        usage[key] += Number(response.usage?.[key] ?? 0);
+      }
+    } catch (error) {
+      // A rejected key or a missing pull request fails the same way for every part, so
+      // only a request-shaped failure is worth trying the next part for.
+      if ([401, 403, 404].includes(Number(error?.status))) {
+        throw error;
+      }
+      failures.push(`part ${index + 1}: ${error.message}`);
+      log(`Part ${index + 1} failed: ${error.message}`);
+    }
+  }
+
+  if (answered === 0) {
+    throw new Error(
+      `The review failed for every part of the diff - ${failures.join(' | ')}`,
+    );
+  }
+  if (failures.length > 0) {
+    log(`${failures.length} part(s) could not be reviewed: ${failures.join(' | ')}`);
+  }
+
+  const parsed = { summary: summaries.join('\n\n'), unparsed };
+  const reviewedNotDropped = new Set(reviewedPaths);
+  const aggregatePayload = {
+    reviewed: reviewedPaths,
+    omitted: [
+      ...omittedPaths,
+      ...droppedBatches
+        .flat()
+        .map((file) => file.path)
+        .filter((path) => !reviewedNotDropped.has(path)),
+    ],
+    truncated:
+      omittedPaths.length > 0 ||
+      droppedBatches.length > 0 ||
+      failures.length > 0,
+  };
+  const { comments, demoted } = normalizeFindings(rawFindings, selected, {
     maxFindings: config.maxFindings,
   });
   log(
-    `Model reported ${parsed.findings.length} finding(s), ${comments.length} inline.`,
+    `Model reported ${rawFindings.length} finding(s), ${comments.length} inline.`,
   );
 
   const latest = await getPullRequest(client, config);
@@ -1606,12 +1810,14 @@ export async function main() {
     summary: parsed.summary,
     comments: fresh,
     demoted,
-    payload,
-    usage: response.usage,
-    model: response.model,
+    payload: aggregatePayload,
+    usage: usage.total_tokens > 0 ? usage : null,
+    model,
     blocking: mustRequestChanges,
     repeated: repeated.length,
     oscillating,
+    batches: reviewedBatches.length,
+    failed: failures,
   });
   const event =
     parsed.unparsed || !mustRequestChanges ? 'COMMENT' : config.event;

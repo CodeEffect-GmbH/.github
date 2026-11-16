@@ -40,6 +40,22 @@ on:
         description: Diff size up to which reasoning is used.
         type: string
         default: '80000'
+      max-diff-chars:
+        description: >-
+          Size of the diff a single review request may carry. A larger diff is reviewed
+          in several requests whose findings are merged.
+        type: string
+        default: '200000'
+      max-batches:
+        description: Highest number of review requests one run may spend on a large diff.
+        type: string
+        default: '6'
+      time-budget-minutes:
+        description: >-
+          Wall clock budget of a run, spent on parts of a large diff. Keep it below
+          `timeout-minutes`.
+        type: string
+        default: '20'
       event:
         description: Review event when the diff has findings.
         type: string
@@ -144,6 +160,9 @@ jobs:
           base-url: ${{ inputs.base-url }}
           thinking: ${{ inputs.thinking }}
           thinking-max-chars: ${{ inputs.thinking-max-chars }}
+          max-diff-chars: ${{ inputs.max-diff-chars }}
+          max-batches: ${{ inputs.max-batches }}
+          time-budget-minutes: ${{ inputs.time-budget-minutes }}
           event: ${{ inputs.event }}
           include-patterns: ${{ inputs.include-patterns }}
           exclude-patterns: ${{ inputs.exclude-patterns }}
